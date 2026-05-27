@@ -18,6 +18,7 @@ COGS = [
     "cogs.moderation",
     "cogs.utility",
     "cogs.playlist",
+    "cogs.ai",
 ]
 
 
