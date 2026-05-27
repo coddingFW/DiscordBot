@@ -17,6 +17,7 @@ COGS = [
     "cogs.music",
     "cogs.moderation",
     "cogs.utility",
+    "cogs.playlist",
 ]
 
 
@@ -42,6 +43,10 @@ class DiscordBot(commands.Bot):
                 log.error("Falha ao carregar %s: %s", cog, exc)
 
     async def on_ready(self):
+        # Limpa sessões de voz antigas para evitar erro 4017
+        for guild in self.guilds:
+            await guild.change_voice_state(channel=None)
+
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,

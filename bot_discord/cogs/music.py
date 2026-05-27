@@ -130,7 +130,7 @@ class Music(commands.Cog, name="Música"):
                 embed=music_embed("Conectado", f"Entrei em **{ctx.author.voice.channel.name}**.")
             )
 
-    @commands.command(name="play", aliases=["p", "tocar"], help="Toca uma música ou URL do YouTube.")
+    @commands.command(name="m", aliases=["tocar"], help="Toca uma música ou URL do YouTube.")
     async def play(self, ctx: commands.Context, *, query: str):
         if not await self._ensure_voice(ctx):
             return
@@ -141,6 +141,10 @@ class Music(commands.Cog, name="Música"):
                 return await ctx.send(
                     embed=music_embed("Erro", "Não consegui encontrar essa música.", discord.Color.red())
                 )
+
+        if not ctx.voice_client:
+            if not await self._ensure_voice(ctx):
+                return
 
         state = self._state(ctx.guild.id)
         state.queue.append(song)
