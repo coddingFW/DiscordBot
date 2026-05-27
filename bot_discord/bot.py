@@ -57,6 +57,62 @@ class DiscordBot(commands.Bot):
         log.info("Bot online: %s (ID: %s)", self.user.name, self.user.id)
         log.info("Servidores: %d | Prefixo: %s", len(self.guilds), self.command_prefix)
 
+    async def on_guild_join(self, guild: discord.Guild):
+        log.info("Adicionado ao servidor: %s (ID: %s) — Total: %d servidores",
+                 guild.name, guild.id, len(self.guilds))
+
+        # Encontra o primeiro canal de texto onde o bot pode enviar mensagens
+        canal = next(
+            (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+            None
+        )
+        if not canal:
+            return
+
+        prefix = self.command_prefix
+        embed = discord.Embed(
+            title="👋 Olá! Eu sou o Good Vibes",
+            description="Obrigado por me adicionar! Aqui vai um resumo do que eu faço:",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="🎵 Música", value=(
+            f"`{prefix}m <música>` — toca uma música do YouTube\n"
+            f"`{prefix}skip` — pula a música\n"
+            f"`{prefix}queue` — ver a fila\n"
+            f"`{prefix}stop` — para e desconecta\n"
+            f"`{prefix}volume <0-100>` — ajusta o volume"
+        ), inline=False)
+        embed.add_field(name="🛡️ Moderação", value=(
+            f"`{prefix}kick @membro` — expulsa\n"
+            f"`{prefix}ban @membro` — bane\n"
+            f"`{prefix}purge <n>` — apaga mensagens\n"
+            f"`{prefix}mute @membro` — silencia\n"
+            f"`{prefix}warn @membro <motivo>` — avisa por DM"
+        ), inline=False)
+        embed.add_field(name="🎶 Playlists", value=(
+            f"`{prefix}playlist criar <nome>` — cria playlist\n"
+            f"`{prefix}playlist add <nome> <música>` — adiciona música\n"
+            f"`{prefix}playlist tocar <nome>` — toca toda a playlist"
+        ), inline=False)
+        embed.add_field(name="🤖 Assistente IA", value=(
+            "Crie um canal chamado `ia` e converse comigo livremente!\n"
+            "Posso tocar músicas, criar canais e muito mais só de pedir."
+        ), inline=False)
+        embed.add_field(name="🔧 Utilitários", value=(
+            f"`{prefix}botinfo` — info do bot\n"
+            f"`{prefix}serverinfo` — info do servidor\n"
+            f"`{prefix}userinfo @membro` — info de um usuário\n"
+            f"`{prefix}ping` — latência"
+        ), inline=False)
+        embed.set_footer(text=f"Use {prefix}help para ver todos os comandos disponíveis.")
+        embed.set_thumbnail(url=self.user.display_avatar.url)
+
+        await canal.send(embed=embed)
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        log.info("Removido do servidor: %s (ID: %s) — Total: %d servidores",
+                 guild.name, guild.id, len(self.guilds))
+
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
         if isinstance(error, commands.CommandNotFound):
             return
