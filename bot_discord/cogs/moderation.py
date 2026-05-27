@@ -65,7 +65,7 @@ class Moderation(commands.Cog, name="Moderação"):
         await ctx.send(embed=mod_embed("Desbanido", f"**{user}** foi desbanido.", discord.Color.green()))
         log.info("%s desbaniu %s", ctx.author, user)
 
-    @commands.command(name="purge", aliases=["limpar", "clear"], help="Apaga mensagens do canal (máx. 100).")
+    @commands.command(name="purge", help="Apaga mensagens do canal (máx. 100).")
     @commands.has_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True)
     async def purge(self, ctx: commands.Context, amount: int):
