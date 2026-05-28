@@ -144,6 +144,29 @@ TOOLS = [
             )
         ),
         types.FunctionDeclaration(
+            name="mutar_membro",
+            description="Silencia um membro do servidor aplicando o cargo Muted.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "membro": types.Schema(type=types.Type.STRING, description="Nome ou apelido do membro"),
+                    "motivo": types.Schema(type=types.Type.STRING, description="Motivo do mute")
+                },
+                required=["membro"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="desmutar_membro",
+            description="Remove o silêncio de um membro do servidor. Requer permissão de gerenciar cargos.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "membro": types.Schema(type=types.Type.STRING, description="Nome ou apelido do membro")
+                },
+                required=["membro"]
+            )
+        ),
+        types.FunctionDeclaration(
             name="listar_canais",
             description="Lista todos os canais do servidor.",
             parameters=types.Schema(type=types.Type.OBJECT, properties={})
@@ -157,7 +180,7 @@ TOOLS = [
 ]
 
 # ── Ações destrutivas que precisam de confirmação ──────────────────────────
-_DESTRUCTIVE = {"kick_membro", "ban_membro", "desbanir_membro", "deletar_canal"}
+_DESTRUCTIVE = {"kick_membro", "ban_membro", "desbanir_membro", "desmutar_membro", "deletar_canal"}
 
 
 class ConfirmView(discord.ui.View):
@@ -342,6 +365,43 @@ class AI(commands.Cog, name="IA"):
                 await membro.ban(reason=motivo)
                 return f"{membro.display_name} foi banido. Motivo: {motivo}"
 
+            elif name == "mutar_membro":
+                if not author.guild_permissions.manage_roles:
+                    return "Você não tem permissão para silenciar membros."
+                nome = args.get("membro", "")
+                motivo = args.get("motivo", "Solicitado via IA")
+                membro = discord.utils.find(
+                    lambda m: m.name.lower() == nome.lower() or m.display_name.lower() == nome.lower(),
+                    guild.members
+                )
+                if not membro:
+                    return f"Membro '{nome}' não encontrado."
+                muted_role = discord.utils.get(guild.roles, name="Muted")
+                if not muted_role:
+                    muted_role = await guild.create_role(name="Muted")
+                    for channel in guild.channels:
+                        await channel.set_permissions(muted_role, send_messages=False, speak=False)
+                if muted_role in membro.roles:
+                    return f"{membro.display_name} já está silenciado."
+                await membro.add_roles(muted_role, reason=motivo)
+                return f"{membro.display_name} foi silenciado. Motivo: {motivo}"
+
+            elif name == "desmutar_membro":
+                if not author.guild_permissions.manage_roles:
+                    return "Você não tem permissão para remover silêncio de membros."
+                nome = args.get("membro", "")
+                membro = discord.utils.find(
+                    lambda m: m.name.lower() == nome.lower() or m.display_name.lower() == nome.lower(),
+                    guild.members
+                )
+                if not membro:
+                    return f"Membro '{nome}' não encontrado."
+                muted_role = discord.utils.get(guild.roles, name="Muted")
+                if not muted_role or muted_role not in membro.roles:
+                    return f"{membro.display_name} não está silenciado."
+                await membro.remove_roles(muted_role)
+                return f"Silêncio de {membro.display_name} removido."
+
             elif name == "desbanir_membro":
                 if not author.guild_permissions.ban_members:
                     return "Você não tem permissão para remover bans."
@@ -383,10 +443,11 @@ class AI(commands.Cog, name="IA"):
     async def _confirm_destructive(self, message: discord.Message, name: str, args: dict) -> bool:
         """Pede confirmação antes de ações destrutivas. Retorna True se confirmado."""
         labels = {
-            "kick_membro": f"⚠️ Expulsar **{args.get('membro', '?')}**?",
-            "ban_membro": f"⚠️ Banir **{args.get('membro', '?')}**?",
-            "desbanir_membro": f"⚠️ Remover o ban de **{args.get('identificador', '?')}**?",
-            "deletar_canal": f"⚠️ Deletar o canal **#{args.get('nome', '?')}**?",
+            "kick_membro":    f"⚠️ Expulsar **{args.get('membro', '?')}**?",
+            "ban_membro":     f"⚠️ Banir **{args.get('membro', '?')}**?",
+            "desbanir_membro":f"⚠️ Remover o ban de **{args.get('identificador', '?')}**?",
+            "desmutar_membro":f"⚠️ Remover o mute de **{args.get('membro', '?')}**?",
+            "deletar_canal":  f"⚠️ Deletar o canal **#{args.get('nome', '?')}**?",
         }
         desc = labels.get(name, "Confirmar ação?")
         motivo = args.get("motivo", "Solicitado via IA")
