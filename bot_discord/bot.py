@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import discord
 from discord.ext import commands
@@ -14,12 +15,27 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 COGS = [
+    "cogs.logs",
     "cogs.music",
     "cogs.moderation",
     "cogs.utility",
     "cogs.playlist",
     "cogs.ai",
 ]
+
+BLACKLIST_FILE = os.path.join(os.path.dirname(__file__), "blacklist.json")
+
+
+def _load_blacklist() -> set[int]:
+    if not os.path.exists(BLACKLIST_FILE):
+        return set()
+    with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+        return set(json.load(f))
+
+
+def _save_blacklist(bl: set[int]):
+    with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(bl), f)
 
 
 class DiscordBot(commands.Bot):
@@ -34,8 +50,12 @@ class DiscordBot(commands.Bot):
             help_command=commands.DefaultHelpCommand(dm_help=True),
             description="Bot multifuncional com música, moderação e utilitários.",
         )
+        self.blacklist: set[int] = _load_blacklist()
 
     async def setup_hook(self):
+        self.add_command(blacklist_add)
+        self.add_command(blacklist_remove)
+        self.add_command(blacklist_ver)
         for cog in COGS:
             try:
                 await self.load_extension(cog)
@@ -145,6 +165,34 @@ class DiscordBot(commands.Bot):
                     color=discord.Color.red(),
                 )
             )
+
+
+@commands.command(name="blacklist-add", aliases=["bl-add"])
+@commands.is_owner()
+async def blacklist_add(ctx: commands.Context, user: discord.User):
+    """(Dono) Adiciona um usuário à blacklist da IA."""
+    ctx.bot.blacklist.add(user.id)
+    _save_blacklist(ctx.bot.blacklist)
+    await ctx.send(f"✅ **{user}** adicionado à blacklist.")
+
+
+@commands.command(name="blacklist-remove", aliases=["bl-remove"])
+@commands.is_owner()
+async def blacklist_remove(ctx: commands.Context, user: discord.User):
+    """(Dono) Remove um usuário da blacklist da IA."""
+    ctx.bot.blacklist.discard(user.id)
+    _save_blacklist(ctx.bot.blacklist)
+    await ctx.send(f"✅ **{user}** removido da blacklist.")
+
+
+@commands.command(name="blacklist-ver", aliases=["bl-list"])
+@commands.is_owner()
+async def blacklist_ver(ctx: commands.Context):
+    """(Dono) Lista usuários na blacklist."""
+    if not ctx.bot.blacklist:
+        return await ctx.send("Blacklist vazia.")
+    lines = [f"<@{uid}> ({uid})" for uid in ctx.bot.blacklist]
+    await ctx.send("**Blacklist:**\n" + "\n".join(lines))
 
 
 def main():

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import discord
 from discord.ext import commands
 import yt_dlp
@@ -27,11 +28,42 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+CACHE_TTL = 3600       # 1 hora
+CACHE_MAX = 100        # entradas máximas
+
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
 
 def music_embed(title: str, description: str, color=discord.Color.blurple()) -> discord.Embed:
     return discord.Embed(title=title, description=description, color=color)
+
+
+class SearchCache:
+    """Cache LRU simples com TTL para buscas do YouTube."""
+
+    def __init__(self, ttl: int = CACHE_TTL, maxsize: int = CACHE_MAX):
+        self._ttl = ttl
+        self._maxsize = maxsize
+        self._store: dict[str, tuple[dict, float]] = {}
+
+    def get(self, key: str) -> dict | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, ts = entry
+        if time.monotonic() - ts > self._ttl:
+            del self._store[key]
+            return None
+        return value
+
+    def set(self, key: str, value: dict):
+        if len(self._store) >= self._maxsize:
+            oldest = min(self._store, key=lambda k: self._store[k][1])
+            del self._store[oldest]
+        self._store[key] = (value, time.monotonic())
+
+
+_search_cache = SearchCache()
 
 
 class GuildMusicState:
@@ -41,6 +73,8 @@ class GuildMusicState:
         self.loop: bool = False
         self.volume: float = 0.5
         self._inactivity_task: asyncio.Task | None = None
+        self._preload_task: asyncio.Task | None = None
+        self._preloaded: dict | None = None  # próxima música pré-carregada
 
 
 class Music(commands.Cog, name="Música"):
@@ -56,6 +90,12 @@ class Music(commands.Cog, name="Música"):
         return self._states[guild_id]
 
     async def _search(self, query: str) -> dict | None:
+        cache_key = query.lower().strip()
+        cached = _search_cache.get(cache_key)
+        if cached:
+            log.debug("Cache hit para '%s'", query)
+            return cached
+
         loop = asyncio.get_running_loop()
         search = query if query.startswith("http") else f"ytsearch:{query}"
         try:
@@ -70,7 +110,7 @@ class Music(commands.Cog, name="Música"):
         else:
             info = data
 
-        return {
+        result = {
             "source": info["url"],
             "title": info.get("title", "Sem título"),
             "url": info.get("webpage_url", ""),
@@ -78,11 +118,33 @@ class Music(commands.Cog, name="Música"):
             "thumbnail": info.get("thumbnail", ""),
             "uploader": info.get("uploader", "Desconhecido"),
         }
+        _search_cache.set(cache_key, result)
+        return result
 
     def _duration_fmt(self, seconds: int) -> str:
         m, s = divmod(seconds, 60)
         h, m = divmod(m, 60)
         return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _schedule_preload(self, state: GuildMusicState):
+        """Pré-carrega a próxima música da fila em background."""
+        if state._preload_task and not state._preload_task.done():
+            return
+        if not state.queue:
+            return
+
+        async def _preload():
+            next_song = state.queue[0]
+            query = next_song.get("_query", next_song.get("url", next_song.get("title", "")))
+            try:
+                result = await self._search(query)
+                if result:
+                    state._preloaded = result
+                    log.debug("Pré-carregado: '%s'", result["title"])
+            except Exception as e:
+                log.debug("Erro no pré-carregamento: %s", e)
+
+        state._preload_task = self.bot.loop.create_task(_preload())
 
     def _play_next(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
@@ -98,17 +160,30 @@ class Music(commands.Cog, name="Música"):
             )
             return
 
-        state.current = state.queue.pop(0)
+        # Usa pré-carregado se disponível e compatível
+        next_song = state.queue[0]
+        if state._preloaded and state._preloaded.get("title") == next_song.get("title"):
+            state.current = state._preloaded
+            state._preloaded = None
+        else:
+            state.current = state.queue[0]
+
+        state.queue.pop(0)
+
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(state.current["source"], **FFMPEG_OPTIONS),
             volume=state.volume,
         )
         ctx.voice_client.play(source, after=lambda _: self._play_next(ctx))
 
+        # Agenda pré-carregamento da próxima
+        self._schedule_preload(state)
+
     async def _auto_disconnect(self, ctx: commands.Context):
         await asyncio.sleep(120)
-        if ctx.voice_client and not ctx.voice_client.is_playing():
-            await ctx.voice_client.disconnect()
+        vc = ctx.voice_client
+        if vc and not vc.is_playing():
+            await vc.disconnect()
             await ctx.send(
                 embed=music_embed("Desconectado", "Saí por inatividade (2 min).", discord.Color.greyple())
             )
@@ -123,6 +198,38 @@ class Music(commands.Cog, name="Música"):
             await ctx.voice_client.move_to(ctx.author.voice.channel)
         return True
 
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ):
+        """Reconecta automaticamente se o bot for desconectado de forma inesperada."""
+        if member.id != self.bot.user.id:
+            return
+        # Bot saiu de um canal (before.channel existia, after.channel é None)
+        if before.channel and not after.channel:
+            guild = member.guild
+            state = self._states.get(guild.id)
+            if not state or not state.current:
+                return
+            # Espera um momento e tenta reconectar
+            await asyncio.sleep(3)
+            if guild.voice_client:
+                return  # já reconectou
+            try:
+                vc = await before.channel.connect()
+                source = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(state.current["source"], **FFMPEG_OPTIONS),
+                    volume=state.volume,
+                )
+                # Cria um contexto fake para _play_next não precisar de ctx real
+                vc.play(source, after=lambda _: None)
+                log.info("Reconectado ao canal de voz '%s' após desconexão inesperada.", before.channel.name)
+            except Exception as e:
+                log.warning("Falha ao reconectar à voz: %s", e)
+
     @commands.command(name="join", aliases=["entrar"], help="Entra no seu canal de voz.")
     async def join(self, ctx: commands.Context):
         if await self._ensure_voice(ctx):
@@ -131,6 +238,7 @@ class Music(commands.Cog, name="Música"):
             )
 
     @commands.command(name="m", aliases=["tocar"], help="Toca uma música ou URL do YouTube.")
+    @commands.cooldown(1, 3, commands.BucketType.user)
     async def play(self, ctx: commands.Context, *, query: str):
         if not await self._ensure_voice(ctx):
             return
@@ -147,6 +255,7 @@ class Music(commands.Cog, name="Música"):
                 return
 
         state = self._state(ctx.guild.id)
+        song["_query"] = query  # guarda query original para pré-carregamento
         state.queue.append(song)
 
         if state._inactivity_task:
@@ -157,6 +266,7 @@ class Music(commands.Cog, name="Música"):
             self._play_next(ctx)
             embed = discord.Embed(title="Tocando agora", color=discord.Color.green())
         else:
+            self._schedule_preload(state)
             embed = discord.Embed(title="Adicionado à fila", color=discord.Color.blurple())
             embed.add_field(name="Posição", value=str(len(state.queue)))
 
@@ -184,6 +294,7 @@ class Music(commands.Cog, name="Música"):
             await ctx.send(embed=music_embed("Erro", "Nada está pausado.", discord.Color.orange()))
 
     @commands.command(name="skip", aliases=["s", "pular"], help="Pula para a próxima música.")
+    @commands.cooldown(1, 2, commands.BucketType.user)
     async def skip(self, ctx: commands.Context):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.stop()
@@ -192,10 +303,12 @@ class Music(commands.Cog, name="Música"):
             await ctx.send(embed=music_embed("Erro", "Nada está tocando.", discord.Color.orange()))
 
     @commands.command(name="stop", aliases=["parar"], help="Para a música e limpa a fila.")
+    @commands.cooldown(1, 5, commands.BucketType.user)
     async def stop(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         state.queue.clear()
         state.current = None
+        state._preloaded = None
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
         await ctx.send(embed=music_embed("Parado", "Fila limpa e bot desconectado.", discord.Color.red()))
@@ -204,7 +317,6 @@ class Music(commands.Cog, name="Música"):
     async def volume(self, ctx: commands.Context, vol: int):
         if not 0 <= vol <= 100:
             return await ctx.send(embed=music_embed("Erro", "O volume deve ser entre 0 e 100.", discord.Color.orange()))
-
         state = self._state(ctx.guild.id)
         state.volume = vol / 100
         if ctx.voice_client and ctx.voice_client.source:
@@ -216,7 +328,6 @@ class Music(commands.Cog, name="Música"):
         state = self._state(ctx.guild.id)
         if not state.current:
             return await ctx.send(embed=music_embed("Nada tocando", "Nenhuma música no momento."))
-
         song = state.current
         embed = discord.Embed(
             title="Tocando agora",
@@ -236,7 +347,6 @@ class Music(commands.Cog, name="Música"):
         state = self._state(ctx.guild.id)
         if not state.queue and not state.current:
             return await ctx.send(embed=music_embed("Fila vazia", "Nenhuma música na fila."))
-
         embed = discord.Embed(title="Fila de Músicas", color=discord.Color.blurple())
         if state.current:
             embed.add_field(
@@ -266,6 +376,7 @@ class Music(commands.Cog, name="Música"):
     async def clear_queue(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         state.queue.clear()
+        state._preloaded = None
         await ctx.send(embed=music_embed("Fila limpa", "Todas as músicas da fila foram removidas."))
 
     @commands.command(name="remove", aliases=["remover"], help="Remove uma música da fila pelo número.")
@@ -275,6 +386,16 @@ class Music(commands.Cog, name="Música"):
             return await ctx.send(embed=music_embed("Erro", "Posição inválida.", discord.Color.orange()))
         removed = state.queue.pop(index - 1)
         await ctx.send(embed=music_embed("Removido", f"**{removed['title']}** removido da fila."))
+
+    @play.error
+    @skip.error
+    @stop.error
+    async def music_cooldown_error(self, ctx: commands.Context, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(
+                embed=music_embed("Devagar aí!", f"Aguarde {error.retry_after:.1f}s.", discord.Color.orange()),
+                delete_after=5,
+            )
 
 
 async def setup(bot: commands.Bot):

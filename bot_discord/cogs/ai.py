@@ -1,5 +1,7 @@
 import os
+import time
 import logging
+import re
 from collections import deque
 import discord
 from discord.ext import commands
@@ -12,6 +14,20 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 AI_CHANNEL_NAME = os.getenv("AI_CHANNEL_NAME", "ia")
 MODEL_NAME = "gemini-2.5-flash"
 MAX_HISTORY = 20
+RATE_LIMIT = 5          # mensagens
+RATE_WINDOW = 60        # por segundo
+MAX_INPUT_LEN = 1000    # caracteres por mensagem
+
+# Padrões suspeitos de prompt injection
+_INJECTION_PATTERNS = re.compile(
+    r"(ignore (all |previous |prior |above )?instructions?|"
+    r"forget (everything|all|your instructions?)|"
+    r"new instructions?:|"
+    r"system( prompt)?:|"
+    r"você agora é|now you are|act as (if )?|"
+    r"jailbreak|DAN mode|pretend (you are|to be))",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """Você é o Good Vibes, assistente do servidor Discord.
 Fale sempre de forma informal, descontraída, como papo entre amigos.
@@ -129,6 +145,27 @@ TOOLS = [
     ])
 ]
 
+# ── Ações destrutivas que precisam de confirmação ──────────────────────────
+_DESTRUCTIVE = {"kick_membro", "ban_membro", "deletar_canal"}
+
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, timeout: float = 30.0):
+        super().__init__(timeout=timeout)
+        self.confirmed: bool | None = None
+
+    @discord.ui.button(label="Confirmar", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        self.stop()
+        await interaction.response.defer()
+
 
 class AI(commands.Cog, name="IA"):
     """Assistente Gemini com ações no servidor."""
@@ -136,6 +173,8 @@ class AI(commands.Cog, name="IA"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._history: dict[int, deque] = {}
+        # rate limit: user_id -> list of timestamps
+        self._rate: dict[int, list[float]] = {}
 
         if not GOOGLE_API_KEY:
             log.warning("GOOGLE_API_KEY não encontrada — cog de IA desativada.")
@@ -144,6 +183,21 @@ class AI(commands.Cog, name="IA"):
 
         self._client = genai.Client(api_key=GOOGLE_API_KEY)
         log.info("Cog IA carregada com modelo %s", MODEL_NAME)
+
+    # ── Rate limiting ──────────────────────────────────────────────────────
+
+    def _check_rate(self, user_id: int) -> bool:
+        """Retorna True se o usuário ainda está dentro do limite."""
+        now = time.monotonic()
+        timestamps = self._rate.setdefault(user_id, [])
+        # Remove entradas fora da janela
+        self._rate[user_id] = [t for t in timestamps if now - t < RATE_WINDOW]
+        if len(self._rate[user_id]) >= RATE_LIMIT:
+            return False
+        self._rate[user_id].append(now)
+        return True
+
+    # ── History helpers ────────────────────────────────────────────────────
 
     def _get_history(self, channel_id: int) -> deque:
         if channel_id not in self._history:
@@ -157,6 +211,8 @@ class AI(commands.Cog, name="IA"):
             contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
         contents.append(types.Content(role="user", parts=[types.Part(text=new_message)]))
         return contents
+
+    # ── Tool execution ─────────────────────────────────────────────────────
 
     async def _execute_tool(self, name: str, args: dict, message: discord.Message) -> str:
         guild = message.guild
@@ -294,6 +350,29 @@ class AI(commands.Cog, name="IA"):
             log.error("Erro ao executar ferramenta '%s': %s", name, e)
             return f"Erro ao executar '{name}': {e}"
 
+    async def _confirm_destructive(self, message: discord.Message, name: str, args: dict) -> bool:
+        """Pede confirmação antes de ações destrutivas. Retorna True se confirmado."""
+        labels = {
+            "kick_membro": f"⚠️ Expulsar **{args.get('membro', '?')}**?",
+            "ban_membro": f"⚠️ Banir **{args.get('membro', '?')}**?",
+            "deletar_canal": f"⚠️ Deletar o canal **#{args.get('nome', '?')}**?",
+        }
+        desc = labels.get(name, "Confirmar ação?")
+        motivo = args.get("motivo", "Solicitado via IA")
+        embed = discord.Embed(
+            title="Confirmação necessária",
+            description=f"{desc}\n**Motivo:** {motivo}",
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="Expira em 30 segundos.")
+        view = ConfirmView()
+        msg = await message.channel.send(embed=embed, view=view)
+        await view.wait()
+        await msg.delete()
+        return view.confirmed is True
+
+    # ── Main listener ──────────────────────────────────────────────────────
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -306,8 +385,30 @@ class AI(commands.Cog, name="IA"):
             await message.channel.send("⚠️ GOOGLE_API_KEY não configurada.")
             return
 
+        # Blacklist check
+        blacklist = getattr(self.bot, "blacklist", set())
+        if message.author.id in blacklist:
+            return
+
+        # Rate limit
+        if not self._check_rate(message.author.id):
+            await message.channel.send(
+                f"{message.author.mention} devagar aí 😅 — máximo {RATE_LIMIT} mensagens por minuto.",
+                delete_after=10,
+            )
+            return
+
         user_input = message.content.strip()
         if not user_input:
+            return
+
+        # Trunca entradas muito longas
+        if len(user_input) > MAX_INPUT_LEN:
+            user_input = user_input[:MAX_INPUT_LEN] + "…"
+
+        # Detecção de prompt injection
+        if _INJECTION_PATTERNS.search(user_input):
+            await message.channel.send("🚫 Parece que você tá tentando me reprogramar, né? Não vai rolar. 😄")
             return
 
         async with message.channel.typing():
@@ -315,7 +416,6 @@ class AI(commands.Cog, name="IA"):
                 contents = self._build_contents(message.channel.id, user_input)
                 reply = ""
 
-                # Loop agêntico: continua até não ter mais chamadas de ferramentas
                 for _ in range(10):
                     response = await self._client.aio.models.generate_content(
                         model=MODEL_NAME,
@@ -336,16 +436,27 @@ class AI(commands.Cog, name="IA"):
                         reply = "\n".join(text_parts)
                         break
 
-                    # Executa as ferramentas
                     contents.append(candidate.content)
                     tool_results = []
                     for part in function_calls:
                         fc = part.function_call
-                        result = await self._execute_tool(
-                            fc.name,
-                            dict(fc.args) if fc.args else {},
-                            message
-                        )
+                        fc_args = dict(fc.args) if fc.args else {}
+
+                        # Confirmação para ações destrutivas
+                        if fc.name in _DESTRUCTIVE:
+                            confirmed = await self._confirm_destructive(message, fc.name, fc_args)
+                            if not confirmed:
+                                result = "Ação cancelada pelo usuário."
+                                log.info("Ferramenta '%s' cancelada pelo usuário.", fc.name)
+                                tool_results.append(types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=fc.name,
+                                        response={"result": result}
+                                    )
+                                ))
+                                continue
+
+                        result = await self._execute_tool(fc.name, fc_args, message)
                         log.info("Ferramenta '%s' executada: %s", fc.name, result)
                         tool_results.append(types.Part(
                             function_response=types.FunctionResponse(
@@ -363,11 +474,8 @@ class AI(commands.Cog, name="IA"):
                     history.append(("model", reply))
 
                 if reply:
-                    if len(reply) <= 2000:
-                        await message.channel.send(reply)
-                    else:
-                        for i in range(0, len(reply), 2000):
-                            await message.channel.send(reply[i:i + 2000])
+                    for i in range(0, len(reply), 2000):
+                        await message.channel.send(reply[i:i + 2000])
 
             except Exception as e:
                 log.error("Erro na API do Gemini: %s", e)
