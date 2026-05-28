@@ -133,6 +133,17 @@ TOOLS = [
             )
         ),
         types.FunctionDeclaration(
+            name="desbanir_membro",
+            description="Remove o ban de um usuário do servidor. Requer permissão de banir membros.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "identificador": types.Schema(type=types.Type.STRING, description="Nome#0000 ou ID numérico do usuário banido")
+                },
+                required=["identificador"]
+            )
+        ),
+        types.FunctionDeclaration(
             name="listar_canais",
             description="Lista todos os canais do servidor.",
             parameters=types.Schema(type=types.Type.OBJECT, properties={})
@@ -146,7 +157,7 @@ TOOLS = [
 ]
 
 # ── Ações destrutivas que precisam de confirmação ──────────────────────────
-_DESTRUCTIVE = {"kick_membro", "ban_membro", "deletar_canal"}
+_DESTRUCTIVE = {"kick_membro", "ban_membro", "desbanir_membro", "deletar_canal"}
 
 
 class ConfirmView(discord.ui.View):
@@ -331,6 +342,25 @@ class AI(commands.Cog, name="IA"):
                 await membro.ban(reason=motivo)
                 return f"{membro.display_name} foi banido. Motivo: {motivo}"
 
+            elif name == "desbanir_membro":
+                if not author.guild_permissions.ban_members:
+                    return "Você não tem permissão para remover bans."
+                identificador = args.get("identificador", "").strip()
+                bans = [entry async for entry in guild.bans()]
+                user = None
+                if identificador.isdigit():
+                    user = next((e.user for e in bans if e.user.id == int(identificador)), None)
+                else:
+                    nome, _, disc = identificador.partition("#")
+                    user = next(
+                        (e.user for e in bans if e.user.name == nome and (not disc or e.user.discriminator == disc)),
+                        None,
+                    )
+                if not user:
+                    return f"Usuário '{identificador}' não encontrado na lista de bans."
+                await guild.unban(user)
+                return f"Ban de {user} removido com sucesso."
+
             # --- Info ---
             elif name == "listar_canais":
                 texto = [f"#{c.name}" for c in guild.text_channels]
@@ -355,6 +385,7 @@ class AI(commands.Cog, name="IA"):
         labels = {
             "kick_membro": f"⚠️ Expulsar **{args.get('membro', '?')}**?",
             "ban_membro": f"⚠️ Banir **{args.get('membro', '?')}**?",
+            "desbanir_membro": f"⚠️ Remover o ban de **{args.get('identificador', '?')}**?",
             "deletar_canal": f"⚠️ Deletar o canal **#{args.get('nome', '?')}**?",
         }
         desc = labels.get(name, "Confirmar ação?")
