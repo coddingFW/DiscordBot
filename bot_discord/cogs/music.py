@@ -241,37 +241,46 @@ class Music(commands.Cog, name="Música"):
 
         def _fetch() -> list[str]:
             queries: list[str] = []
-            try:
-                if resource_type == "track":
-                    t = self._sp.track(url)
-                    queries.append(f"{t['name']} {t['artists'][0]['name']}")
 
-                elif resource_type == "playlist":
-                    page = self._sp.playlist_tracks(url, limit=100)
-                    while page and len(queries) < PLAYLIST_MAX:
-                        for item in page.get("items") or []:
-                            track = item.get("track")
-                            if not track or track.get("is_local"):
-                                continue
-                            queries.append(f"{track['name']} {track['artists'][0]['name']}")
-                            if len(queries) >= PLAYLIST_MAX:
-                                break
-                        page = self._sp.next(page) if page.get("next") else None
+            if resource_type == "track":
+                t = self._sp.track(url)
+                queries.append(f"{t['name']} {t['artists'][0]['name']}")
 
-                elif resource_type == "album":
-                    page = self._sp.album_tracks(url, limit=50)
-                    while page and len(queries) < PLAYLIST_MAX:
-                        for item in page.get("items") or []:
-                            queries.append(f"{item['name']} {item['artists'][0]['name']}")
-                            if len(queries) >= PLAYLIST_MAX:
-                                break
-                        page = self._sp.next(page) if page.get("next") else None
+            elif resource_type == "playlist":
+                # playlist_items substitui playlist_tracks no spotipy >= 2.22
+                page = self._sp.playlist_items(
+                    url, limit=100, additional_types=("track",)
+                )
+                while page and len(queries) < PLAYLIST_MAX:
+                    for item in page.get("items") or []:
+                        track = item.get("track")
+                        if not track or track.get("is_local"):
+                            continue
+                        # Ignora episódios de podcast
+                        if track.get("type") != "track":
+                            continue
+                        queries.append(f"{track['name']} {track['artists'][0]['name']}")
+                        if len(queries) >= PLAYLIST_MAX:
+                            break
+                    page = self._sp.next(page) if page.get("next") else None
 
-            except Exception as e:
-                log.error("Erro na API do Spotify: %s", e)
+            elif resource_type == "album":
+                page = self._sp.album_tracks(url, limit=50)
+                while page and len(queries) < PLAYLIST_MAX:
+                    for item in page.get("items") or []:
+                        queries.append(f"{item['name']} {item['artists'][0]['name']}")
+                        if len(queries) >= PLAYLIST_MAX:
+                            break
+                    page = self._sp.next(page) if page.get("next") else None
+
             return queries
 
-        queries = await loop.run_in_executor(None, _fetch)
+        try:
+            queries = await loop.run_in_executor(None, _fetch)
+        except Exception as e:
+            log.error("Erro na API do Spotify: %s", e)
+            raise  # propaga para o play() mostrar a mensagem de erro real
+
         return [{
             "title": q,
             "url": "",
@@ -508,7 +517,11 @@ class Music(commands.Cog, name="Música"):
 
             msg = await ctx.send(embed=music_embed("Spotify 🎵", f"Carregando {tipo_label}...", discord.Color.green()))
             async with ctx.typing():
-                songs = await self._extract_spotify(query)
+                try:
+                    songs = await self._extract_spotify(query)
+                except Exception as e:
+                    await msg.delete()
+                    return await ctx.send(embed=music_embed("Erro no Spotify", f"`{e}`", discord.Color.red()))
             await msg.delete()
 
             if not songs:
