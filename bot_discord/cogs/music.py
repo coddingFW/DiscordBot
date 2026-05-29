@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
 import aiohttp
@@ -55,6 +56,9 @@ _SPOTIFY_RE = re.compile(
 _YT_PLAYLIST_RE = re.compile(
     r"(?:youtube\.com|youtu\.be).*[?&]list=|youtube\.com/playlist"
 )
+# SoundCloud: qualquer URL do soundcloud; "/sets/" indica playlist/álbum.
+_SOUNDCLOUD_RE = re.compile(r"https?://(?:www\.|on\.|m\.)?soundcloud\.com/")
+_SOUNDCLOUD_SET_RE = re.compile(r"https?://(?:www\.|m\.)?soundcloud\.com/[^/]+/sets/")
 
 # ── Spotipy (opcional) ────────────────────────────────────────────────────
 try:
@@ -101,6 +105,64 @@ def music_embed(title: str, description: str, color=discord.Color.blurple()) -> 
     return discord.Embed(title=title, description=description, color=color)
 
 
+# ── Painel de controle interativo ─────────────────────────────────────────
+class MusicControlView(discord.ui.View):
+    def __init__(self, cog: "Music", guild_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+
+    @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message("Não estou em nenhum canal de voz.", ephemeral=True)
+        if vc.is_playing():
+            vc.pause()
+            button.emoji = "▶️"
+        elif vc.is_paused():
+            vc.resume()
+            button.emoji = "⏸"
+        else:
+            return await interaction.response.send_message("Nada tocando.", ephemeral=True)
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.response.send_message("⏭ Pulando...", ephemeral=True, delete_after=2)
+        else:
+            await interaction.response.send_message("Nada tocando.", ephemeral=True)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.cog._state(self.guild_id)
+        if not state.queue:
+            return await interaction.response.send_message("A fila está vazia.", ephemeral=True)
+        random.shuffle(state.queue)
+        await interaction.response.send_message(f"🔀 Fila embaralhada! ({len(state.queue)} músicas)", ephemeral=True)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def toggle_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.cog._state(self.guild_id)
+        state.loop = not state.loop
+        button.style = discord.ButtonStyle.success if state.loop else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger)
+    async def stop_music(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.cog._state(self.guild_id)
+        state.queue.clear()
+        state.current = None
+        state.control_message = None
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect()
+        self.stop()
+        await interaction.response.edit_message(view=None)
+
+
 # ── Cache de busca ────────────────────────────────────────────────────────
 class SearchCache:
     """Cache LRU simples com TTL para buscas do YouTube."""
@@ -140,6 +202,8 @@ class GuildMusicState:
         self._inactivity_task: asyncio.Task | None = None
         self._preload_task: asyncio.Task | None = None
         self._preloaded: dict | None = None
+        self.control_message: discord.Message | None = None
+        self.control_ctx: "commands.Context | None" = None
 
 
 # ── Cog principal ─────────────────────────────────────────────────────────
@@ -179,6 +243,12 @@ class Music(commands.Cog, name="Música"):
     def _is_yt_playlist(self, query: str) -> bool:
         return bool(_YT_PLAYLIST_RE.search(query))
 
+    def _is_soundcloud(self, query: str) -> bool:
+        return bool(_SOUNDCLOUD_RE.match(query))
+
+    def _is_soundcloud_set(self, query: str) -> bool:
+        return bool(_SOUNDCLOUD_SET_RE.match(query))
+
     # ── Busca única (YouTube) ─────────────────────────────────────────────
 
     async def _search(self, query: str) -> dict | None:
@@ -215,10 +285,10 @@ class Music(commands.Cog, name="Música"):
         _search_cache.set(cache_key, result)
         return result
 
-    # ── Extração de playlist YouTube ──────────────────────────────────────
+    # ── Extração de playlist (YouTube / SoundCloud) ───────────────────────
 
-    async def _extract_yt_playlist(self, url: str) -> list[dict]:
-        """Retorna metadados de todos os vídeos de uma playlist do YouTube."""
+    async def _extract_playlist(self, url: str) -> list[dict]:
+        """Retorna metadados de todas as faixas de uma playlist (YouTube ou SoundCloud)."""
         loop = asyncio.get_running_loop()
 
         def _fetch():
@@ -229,12 +299,14 @@ class Music(commands.Cog, name="Música"):
             for e in data.get("entries") or []:
                 if not e:
                     continue
+                # Prefere a URL completa do item (SoundCloud já traz o permalink);
+                # senão, monta a URL do YouTube a partir do id do vídeo.
+                vid_url = e.get("url") or ""
                 vid_id = e.get("id") or ""
-                vid_url = (
-                    f"https://www.youtube.com/watch?v={vid_id}"
-                    if vid_id and not vid_id.startswith("http")
-                    else e.get("url", "")
-                )
+                if not vid_url.startswith("http") and vid_id:
+                    vid_url = f"https://www.youtube.com/watch?v={vid_id}"
+                if not vid_url:
+                    continue
                 thumbnails = e.get("thumbnails") or []
                 thumbnail = thumbnails[-1].get("url", "") if thumbnails else e.get("thumbnail", "")
                 results.append({
@@ -242,7 +314,7 @@ class Music(commands.Cog, name="Música"):
                     "url": vid_url,
                     "duration": e.get("duration") or 0,
                     "thumbnail": thumbnail,
-                    "uploader": e.get("uploader") or e.get("channel") or "YouTube",
+                    "uploader": e.get("uploader") or e.get("channel") or "Desconhecido",
                     "source": "",
                     "_needs_fetch": True,
                     "_query": vid_url,
@@ -254,7 +326,7 @@ class Music(commands.Cog, name="Música"):
         try:
             return await loop.run_in_executor(None, _fetch)
         except Exception as e:
-            log.error("Erro ao extrair playlist YT: %s", e)
+            log.error("Erro ao extrair playlist: %s", e)
             return []
 
     # ── Extração de Spotify ───────────────────────────────────────────────
@@ -400,6 +472,7 @@ class Music(commands.Cog, name="Música"):
             volume=state.volume,
         )
         ctx.voice_client.play(source, after=lambda _: self._play_next(ctx))
+        self.bot.loop.create_task(self._update_control_panel(ctx, song))
 
     async def _fetch_and_play(self, ctx: commands.Context, song: dict):
         """Resolve a URL de áudio de uma música lazy e inicia a reprodução."""
@@ -420,7 +493,7 @@ class Music(commands.Cog, name="Música"):
         song["_needs_fetch"] = False
         vc = ctx.voice_client
         if vc and not vc.is_playing() and not vc.is_paused():
-            self._start_playing(ctx, song)
+            self._start_playing(ctx, song)  # _start_playing já chama _update_control_panel
 
     def _play_next(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
@@ -432,6 +505,7 @@ class Music(commands.Cog, name="Música"):
             if state._inactivity_task:
                 state._inactivity_task.cancel()
             state._inactivity_task = self.bot.loop.create_task(self._auto_disconnect(ctx))
+            self.bot.loop.create_task(self._update_control_panel(ctx, None))
             return
 
         # A próxima faixa pode já ter sido resolvida pelo pré-carregamento.
@@ -442,7 +516,7 @@ class Music(commands.Cog, name="Música"):
         if state.current.get("_needs_fetch"):
             self.bot.loop.create_task(self._fetch_and_play(ctx, state.current))
         else:
-            self._start_playing(ctx, state.current)
+            self._start_playing(ctx, state.current)  # _start_playing já chama _update_control_panel
 
     async def _auto_disconnect(self, ctx: commands.Context):
         await asyncio.sleep(120)
@@ -453,15 +527,85 @@ class Music(commands.Cog, name="Música"):
                 embed=music_embed("Desconectado", "Saí por inatividade (2 min).", discord.Color.greyple())
             )
 
+    async def _update_control_panel(self, ctx: commands.Context, song: dict | None):
+        """Envia ou edita o painel de controle fixo com botões interativos."""
+        state = self._state(ctx.guild.id)
+        if song is None:
+            if state.control_message:
+                try:
+                    await state.control_message.edit(view=None)
+                except Exception:
+                    pass
+                state.control_message = None
+            return
+
+        url = song.get("url", "")
+        embed = discord.Embed(
+            title="Tocando agora",
+            description=f"[{song['title']}]({url})" if url else song["title"],
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Duração", value=self._duration_fmt(song.get("duration", 0)))
+        embed.add_field(name="Canal", value=song.get("uploader", "?"))
+        embed.add_field(name="Loop", value="🔁 On" if state.loop else "Off")
+        embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%")
+        if state.queue:
+            proxima = state.queue[0]
+            embed.add_field(name="A seguir", value=proxima["title"][:50], inline=False)
+        if song.get("thumbnail"):
+            embed.set_thumbnail(url=song["thumbnail"])
+        embed.set_footer(text="⏸ pausar  ⏭ pular  🔀 shuffle  🔁 loop  ⏹ parar")
+
+        view = MusicControlView(self, ctx.guild.id)
+
+        if state.control_message:
+            try:
+                await state.control_message.edit(embed=embed, view=view)
+                return
+            except Exception:
+                state.control_message = None
+
+        channel = state.control_ctx.channel if state.control_ctx else ctx.channel
+        state.control_message = await channel.send(embed=embed, view=view)
+        state.control_ctx = ctx
+
     async def _ensure_voice(self, ctx: commands.Context) -> bool:
         if not ctx.author.voice:
             await ctx.send(embed=music_embed("Erro", "Entre em um canal de voz primeiro.", discord.Color.red()))
             return False
-        if not ctx.voice_client:
-            await ctx.author.voice.channel.connect()
-        elif ctx.voice_client.channel != ctx.author.voice.channel:
-            await ctx.voice_client.move_to(ctx.author.voice.channel)
-        return True
+        canal = ctx.author.voice.channel
+        if ctx.voice_client and ctx.voice_client.channel == canal:
+            return True
+
+        # A conexão de voz do Discord às vezes cai por soluço de rede
+        # (ex.: ClientOSError / WinError 64). Tentamos algumas vezes antes de desistir.
+        last_exc = None
+        for tentativa in range(3):
+            try:
+                if ctx.voice_client:
+                    await ctx.voice_client.move_to(canal)
+                else:
+                    await canal.connect()
+                return True
+            except Exception as e:
+                last_exc = e
+                log.warning("Falha ao conectar na voz (tentativa %d/3): %s", tentativa + 1, e)
+                # Limpa uma conexão pela metade antes de tentar de novo.
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect(force=True)
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.5)
+
+        log.error("Não foi possível conectar ao canal de voz: %s", last_exc)
+        await ctx.send(embed=music_embed(
+            "Erro de conexão",
+            "Não consegui entrar no canal de voz — a conexão com o Discord oscilou. "
+            "Tenta de novo daqui a pouco. 🎧",
+            discord.Color.red(),
+        ))
+        return False
 
     # ── Fila: adicionar uma ───────────────────────────────────────────────
 
@@ -477,20 +621,22 @@ class Music(commands.Cog, name="Música"):
             state._inactivity_task = None
 
         if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+            # _play_next → _start_playing → _update_control_panel cuida do embed
             self._play_next(ctx)
-            embed = discord.Embed(title="Tocando agora", color=discord.Color.green())
         else:
             self._schedule_preload(state)
-            embed = discord.Embed(title="Adicionado à fila", color=discord.Color.blurple())
+            url = song.get("url", "")
+            embed = discord.Embed(
+                title="Adicionado à fila",
+                description=f"[{song['title']}]({url})" if url else song["title"],
+                color=discord.Color.blurple(),
+            )
             embed.add_field(name="Posição", value=str(len(state.queue)))
-
-        url = song.get("url", "")
-        embed.description = f"[{song['title']}]({url})" if url else song["title"]
-        embed.add_field(name="Duração", value=self._duration_fmt(song.get("duration", 0)))
-        embed.add_field(name="Canal", value=song.get("uploader", "?"))
-        if song.get("thumbnail"):
-            embed.set_thumbnail(url=song["thumbnail"])
-        await ctx.send(embed=embed)
+            embed.add_field(name="Duração", value=self._duration_fmt(song.get("duration", 0)))
+            embed.add_field(name="Canal", value=song.get("uploader", "?"))
+            if song.get("thumbnail"):
+                embed.set_thumbnail(url=song["thumbnail"])
+            await ctx.send(embed=embed)
 
     # ── Fila: adicionar várias ────────────────────────────────────────────
 
@@ -556,7 +702,7 @@ class Music(commands.Cog, name="Música"):
         if await self._ensure_voice(ctx):
             await ctx.send(embed=music_embed("Conectado", f"Entrei em **{ctx.author.voice.channel.name}**."))
 
-    @commands.command(name="m", aliases=["tocar"], help="Toca música, URL do YouTube ou link do Spotify (faixa/playlist/álbum).")
+    @commands.command(name="m", aliases=["tocar"], help="Toca música por nome, ou link do YouTube, Spotify ou SoundCloud (faixa/playlist).")
     @commands.cooldown(1, 3, commands.BucketType.user)
     async def play(self, ctx: commands.Context, *, query: str):
         if not await self._ensure_voice(ctx):
@@ -603,16 +749,19 @@ class Music(commands.Cog, name="Música"):
                 await self._enqueue_many(ctx, songs, f"Spotify ({tipo_label})")
             return
 
-        # ── Playlist do YouTube ───────────────────────────────────────────
-        if self._is_yt_playlist(query):
-            msg = await ctx.send(embed=music_embed("YouTube Playlist 🎵", "Carregando playlist...", discord.Color.red()))
+        # ── Playlist do YouTube ou set do SoundCloud ──────────────────────
+        if self._is_yt_playlist(query) or self._is_soundcloud_set(query):
+            is_sc = self._is_soundcloud_set(query)
+            origem = "SoundCloud" if is_sc else "YouTube"
+            cor = discord.Color.orange() if is_sc else discord.Color.red()
+            msg = await ctx.send(embed=music_embed(f"{origem} Playlist 🎵", "Carregando playlist...", cor))
             async with ctx.typing():
-                songs = await self._extract_yt_playlist(query)
+                songs = await self._extract_playlist(query)
             await msg.delete()
 
             if not songs:
                 return await ctx.send(embed=music_embed("Erro", "Não consegui carregar essa playlist.", discord.Color.red()))
-            await self._enqueue_many(ctx, songs, "YouTube Playlist")
+            await self._enqueue_many(ctx, songs, f"{origem} Playlist")
             return
 
         # ── Música/URL única ──────────────────────────────────────────────

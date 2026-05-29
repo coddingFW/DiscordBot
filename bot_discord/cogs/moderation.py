@@ -138,36 +138,6 @@ class Moderation(commands.Cog, name="Moderação"):
         ))
         log.info("%s removeu mute de %s", ctx.author, member)
 
-    @commands.command(name="warn", help="Avisa um membro por mensagem direta.")
-    @commands.has_permissions(manage_messages=True)
-    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
-        try:
-            await member.send(
-                embed=discord.Embed(
-                    title=f"Aviso em {ctx.guild.name}",
-                    description=f"Você recebeu um aviso.\n**Motivo:** {reason}",
-                    color=discord.Color.orange(),
-                )
-            )
-            sent = True
-        except discord.Forbidden:
-            sent = False
-
-        dm_status = "" if sent else "\n*(Não foi possível enviar DM ao usuário)*"
-        await ctx.send(
-            embed=mod_embed(
-                "Aviso Enviado",
-                f"{member.mention} foi avisado.\n**Motivo:** {reason}{dm_status}",
-                discord.Color.orange(),
-            )
-        )
-        await send_log(ctx.guild, log_embed(
-            "⚠️ Aviso Emitido", discord.Color.orange(),
-            Usuário=f"{member} ({member.id})",
-            Moderador=str(ctx.author),
-            Motivo=reason,
-        ))
-
     @kick.error
     @ban.error
     @purge.error

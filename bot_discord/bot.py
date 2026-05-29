@@ -18,6 +18,7 @@ COGS = [
     "cogs.logs",
     "cogs.music",
     "cogs.moderation",
+    "cogs.warns",
     "cogs.utility",
     "cogs.playlist",
     "cogs.ai",
@@ -107,7 +108,9 @@ class DiscordBot(commands.Bot):
             f"`{prefix}ban @membro` — bane\n"
             f"`{prefix}purge <n>` — apaga mensagens\n"
             f"`{prefix}mute @membro` — silencia\n"
-            f"`{prefix}warn @membro <motivo>` — avisa por DM"
+            f"`{prefix}warn @membro <motivo>` — aviso com histórico (auto-mute em 3, auto-ban em 5)\n"
+            f"`{prefix}warns @membro` — ver histórico de avisos\n"
+            f"`{prefix}clearwarns @membro` — limpar todos os avisos"
         ), inline=False)
         embed.add_field(name="🎶 Playlists", value=(
             f"`{prefix}playlist criar <nome>` — cria playlist\n"
