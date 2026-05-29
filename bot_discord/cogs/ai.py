@@ -4,6 +4,7 @@ import logging
 import re
 import asyncio
 import tempfile
+import unicodedata
 from collections import deque
 import discord
 from discord.ext import commands
@@ -34,6 +35,15 @@ _INJECTION_PATTERNS = re.compile(
     r"jailbreak|DAN mode|pretend (you are|to be))",
     re.IGNORECASE,
 )
+
+def _norm_channel(nome: str) -> str:
+    """Normaliza nome de canal: minúsculas, sem acento, espaços→hífen.
+    Ajuda a casar 'Material Acadêmico' com 'material-academico'."""
+    nome = nome.strip().lower().replace(" ", "-")
+    # Remove acentos (NFKD separa o acento; descarta os 'combining marks').
+    nome = "".join(c for c in unicodedata.normalize("NFKD", nome) if not unicodedata.combining(c))
+    return nome
+
 
 def _is_daily_quota(msg: str) -> bool:
     """True se o erro for o limite DIÁRIO da cota (não adianta tentar de novo hoje)."""
@@ -108,7 +118,12 @@ Você sabe de tudo — história, ciência, cultura pop, tecnologia, curiosidade
 
 Você foi criado por coddingFW. Se alguém perguntar quem te criou ou te desenvolveu, fala que foi o coddingFW e manda o perfil dele no GitHub: https://github.com/coddingFW
 
-Você também tem ferramentas para agir no servidor. Quando o usuário pedir algo que envolva música, canais ou moderação, USE as ferramentas — não explique como fazer, FAÇA."""
+Você também tem ferramentas para agir no servidor. Quando o usuário pedir algo que envolva música, canais ou moderação, USE as ferramentas — não explique como fazer, FAÇA.
+
+REGRAS IMPORTANTES sobre canais:
+- Para PUBLICAR/POSTAR/ENVIAR/ESCREVER um conteúdo em um canal, use 'publicar_em_canal'. NUNCA use 'criar_canal' para isso.
+- Só use 'criar_canal' quando o usuário pedir explicitamente para CRIAR um canal novo.
+- Nunca crie o mesmo canal mais de uma vez. Se uma ferramenta disser que o canal já existe ou não foi encontrado, NÃO tente de novo — apenas explique o resultado ao usuário."""
 
 TOOLS = [
     types.Tool(function_declarations=[
@@ -165,6 +180,18 @@ TOOLS = [
                     "categoria": types.Schema(type=types.Type.STRING, description="Nome da categoria onde criar (opcional)")
                 },
                 required=["nome", "tipo"]
+            )
+        ),
+        types.FunctionDeclaration(
+            name="publicar_em_canal",
+            description="Publica/envia uma mensagem de texto em um canal de texto existente, identificado pelo nome. Use isto quando o usuário pedir para 'publicar', 'postar', 'enviar' ou 'escrever' algo em um canal. NÃO crie um canal novo para publicar.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "canal": types.Schema(type=types.Type.STRING, description="Nome do canal de texto onde publicar"),
+                    "mensagem": types.Schema(type=types.Type.STRING, description="O conteúdo da mensagem a publicar")
+                },
+                required=["canal", "mensagem"]
             )
         ),
         types.FunctionDeclaration(
@@ -481,12 +508,45 @@ class AI(commands.Cog, name="IA"):
                 nome = args.get("nome", "")
                 tipo = args.get("tipo", "texto")
                 categoria_nome = args.get("categoria")
+                # Evita duplicatas: se já existe um canal com esse nome, não cria de novo.
+                existente = discord.utils.find(
+                    lambda c: _norm_channel(c.name) == _norm_channel(nome),
+                    guild.channels,
+                )
+                if existente:
+                    return f"O canal '{existente.name}' já existe — não criei outro."
                 categoria = discord.utils.get(guild.categories, name=categoria_nome) if categoria_nome else None
                 if tipo == "voz":
                     canal = await guild.create_voice_channel(nome, category=categoria)
                 else:
                     canal = await guild.create_text_channel(nome, category=categoria)
                 return f"Canal '{canal.name}' criado!"
+
+            elif name == "publicar_em_canal":
+                if not author.guild_permissions.manage_messages:
+                    return "Você não tem permissão para publicar em canais."
+                nome = args.get("canal", "")
+                conteudo = args.get("mensagem", "")
+                if not conteudo.strip():
+                    return "Não há mensagem para publicar."
+                alvo = _norm_channel(nome)
+                canais_texto = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
+                # 1) match exato (sem acento); 2) fallback: começa com / contém o nome pedido.
+                canal = (
+                    discord.utils.find(lambda c: _norm_channel(c.name) == alvo, canais_texto)
+                    or discord.utils.find(lambda c: _norm_channel(c.name).startswith(alvo), canais_texto)
+                    or discord.utils.find(lambda c: alvo in _norm_channel(c.name), canais_texto)
+                )
+                if not canal:
+                    disponiveis = ", ".join(f"#{c.name}" for c in canais_texto[:15]) or "(nenhum)"
+                    return (
+                        f"Canal de texto '{nome}' não encontrado — NÃO publiquei nada. "
+                        f"Canais disponíveis: {disponiveis}. "
+                        f"Avise o usuário com sinceridade que o canal não existe; não diga que publicou."
+                    )
+                for chunk in (conteudo[i:i + 2000] for i in range(0, len(conteudo), 2000)):
+                    await canal.send(chunk)
+                return f"Mensagem publicada no canal #{canal.name}."
 
             elif name == "deletar_canal":
                 if not author.guild_permissions.manage_channels:
