@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 import unicodedata
 from collections import deque
+import aiosqlite
 import discord
 from discord.ext import commands
 from google import genai
@@ -15,10 +16,23 @@ import edge_tts
 log = logging.getLogger("cog.ai")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-AI_CHANNEL_NAME = os.getenv("AI_CHANNEL_NAME", "ia")
+AI_CHANNEL_NAME = os.getenv("AI_CHANNEL_NAME", "ia")  # nome padrão (fallback global)
+AI_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "ai_config.db")
 TTS_VOICE = os.getenv("TTS_VOICE", "pt-BR-ThalitaNeural")
 TTS_RATE = os.getenv("TTS_RATE", "-3%")   # leve desaceleração soa mais natural
 TTS_PITCH = os.getenv("TTS_PITCH", "+2Hz")
+
+# Vozes pt-BR disponíveis (edge-tts): chave -> (rótulo amigável, id da voz)
+VOICE_PRESETS = {
+    "thalita":   ("Thalita — feminina (padrão)", "pt-BR-ThalitaNeural"),
+    "francisca": ("Francisca — feminina",        "pt-BR-FranciscaNeural"),
+    "giovanna":  ("Giovanna — feminina jovem",   "pt-BR-GiovannaNeural"),
+    "leticia":   ("Letícia — feminina suave",    "pt-BR-LeticiaNeural"),
+    "antonio":   ("Antônio — masculina",         "pt-BR-AntonioNeural"),
+    "fabio":     ("Fábio — masculina",           "pt-BR-FabioNeural"),
+    "humberto":  ("Humberto — masculina grave",  "pt-BR-HumbertoNeural"),
+}
+DEFAULT_VOICE = "thalita"
 MODEL_NAME = os.getenv("AI_MODEL", "gemini-2.5-flash")
 MAX_HISTORY = 20
 RATE_LIMIT = 5          # mensagens
@@ -107,16 +121,44 @@ def _friendly_error(exc: Exception) -> str:
     )
 
 
-SYSTEM_PROMPT = """Você é o Good Vibes, assistente do servidor Discord.
-Fale sempre de forma informal, descontraída, como papo entre amigos.
-Use gírias brasileiras, emojis quando fizer sentido, mas sem exagerar.
-Respostas curtas — ninguém quer textão.
-Se o papo for engraçado, entra na brincadeira.
+# Tonalidades disponíveis: chave -> (rótulo amigável, instrução injetada no prompt)
+TONE_PRESETS = {
+    "informal": (
+        "Descontraído (padrão)",
+        "Fale de forma informal, descontraída, como papo entre amigos. "
+        "Use gírias brasileiras e emojis quando fizer sentido, sem exagerar. "
+        "Respostas curtas — ninguém quer textão. Se o papo for engraçado, entra na brincadeira.",
+    ),
+    "formal": (
+        "Formal e profissional",
+        "Fale de maneira formal, educada e profissional. Trate o usuário por você, "
+        "evite gírias e emojis, use boa gramática e mantenha um tom respeitoso e claro.",
+    ),
+    "neutro": (
+        "Neutro e objetivo",
+        "Fale de forma neutra, objetiva e direta. Sem gírias e sem formalidade excessiva. "
+        "Vá direto ao ponto, sem enrolação.",
+    ),
+    "tecnico": (
+        "Técnico e detalhado",
+        "Responda de forma técnica, precisa e detalhada, usando os termos corretos da área. "
+        "Pode se aprofundar quando o assunto exigir.",
+    ),
+    "divertido": (
+        "Divertido e brincalhão",
+        "Seja bem-humorado e brincalhão, solta piadas leves e use emojis à vontade. "
+        "Mantenha a energia alta e o clima leve, sem perder a utilidade da resposta.",
+    ),
+}
+DEFAULT_TONE = "informal"
+
+_BASE_PROMPT = """Você é o Good Vibes, assistente do servidor Discord.
+{tone}
 Responda sempre em português do Brasil.
 
-Você sabe de tudo — história, ciência, cultura pop, tecnologia, curiosidades, o que for. Responda qualquer pergunta normalmente, como um amigo bem informado.
+Você sabe de tudo — história, ciência, cultura pop, tecnologia, curiosidades, o que for. Responda qualquer pergunta normalmente, como alguém bem informado.
 
-Você foi criado por coddingFW. Se alguém perguntar quem te criou ou te desenvolveu, fala que foi o coddingFW e manda o perfil dele no GitHub: https://github.com/coddingFW
+Você foi criado por coddingFW. Se alguém perguntar quem te criou ou te desenvolveu, diga que foi o coddingFW e mande o perfil dele no GitHub: https://github.com/coddingFW
 
 Você também tem ferramentas para agir no servidor. Quando o usuário pedir algo que envolva música, canais ou moderação, USE as ferramentas — não explique como fazer, FAÇA.
 
@@ -124,6 +166,12 @@ REGRAS IMPORTANTES sobre canais:
 - Para PUBLICAR/POSTAR/ENVIAR/ESCREVER um conteúdo em um canal, use 'publicar_em_canal'. NUNCA use 'criar_canal' para isso.
 - Só use 'criar_canal' quando o usuário pedir explicitamente para CRIAR um canal novo.
 - Nunca crie o mesmo canal mais de uma vez. Se uma ferramenta disser que o canal já existe ou não foi encontrado, NÃO tente de novo — apenas explique o resultado ao usuário."""
+
+
+def _build_system_prompt(tone_key: str) -> str:
+    """Monta o prompt do sistema com a tonalidade escolhida."""
+    _, instrucao = TONE_PRESETS.get(tone_key, TONE_PRESETS[DEFAULT_TONE])
+    return _BASE_PROMPT.format(tone=instrucao)
 
 TOOLS = [
     types.Tool(function_declarations=[
@@ -302,27 +350,28 @@ def _clean_for_tts(text: str) -> str:
     return text.strip()
 
 
-async def _tts_to_file(text: str) -> str:
+async def _tts_to_file(text: str, voice: str = TTS_VOICE) -> str:
     """Gera áudio TTS e retorna o caminho do arquivo mp3 temporário."""
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         tmp_path = f.name
     clean = _clean_for_tts(text) or "Sem texto para ler."
-    communicate = edge_tts.Communicate(clean, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
+    communicate = edge_tts.Communicate(clean, voice, rate=TTS_RATE, pitch=TTS_PITCH)
     await communicate.save(tmp_path)
     return tmp_path
 
 
 class TTSView(discord.ui.View):
-    def __init__(self, text: str):
+    def __init__(self, text: str, voice: str = TTS_VOICE):
         super().__init__(timeout=120)
         self.text = text
+        self.voice = voice
 
     @discord.ui.button(label="🔊 Ouvir", style=discord.ButtonStyle.secondary)
     async def ouvir(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         tmp_path = None
         try:
-            tmp_path = await _tts_to_file(self.text)
+            tmp_path = await _tts_to_file(self.text, self.voice)
             await interaction.followup.send(
                 file=discord.File(tmp_path, filename="resposta.mp3"),
                 ephemeral=True,
@@ -364,6 +413,13 @@ class AI(commands.Cog, name="IA"):
         self._history: dict[int, deque] = {}
         # rate limit: user_id -> list of timestamps
         self._rate: dict[int, list[float]] = {}
+        # Canal da IA por servidor: guild_id -> channel_id (carregado do banco)
+        self._guild_channels: dict[int, int] = {}
+        # Tonalidade por servidor: guild_id -> chave de TONE_PRESETS
+        self._guild_tones: dict[int, str] = {}
+        # Voz por servidor: guild_id -> chave de VOICE_PRESETS
+        self._guild_voices: dict[int, str] = {}
+        self._db: aiosqlite.Connection | None = None
 
         if not GOOGLE_API_KEY:
             log.warning("GOOGLE_API_KEY não encontrada — cog de IA desativada.")
@@ -372,6 +428,73 @@ class AI(commands.Cog, name="IA"):
 
         self._client = genai.Client(api_key=GOOGLE_API_KEY)
         log.info("Cog IA carregada com modelo %s", MODEL_NAME)
+
+    async def cog_load(self):
+        # Banco de configuração por servidor (qual canal a IA escuta).
+        self._db = await aiosqlite.connect(AI_DB_PATH)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS canais_ia (
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS tons_ia (
+                guild_id INTEGER PRIMARY KEY,
+                tom      TEXT NOT NULL
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS vozes_ia (
+                guild_id INTEGER PRIMARY KEY,
+                voz      TEXT NOT NULL
+            )
+        """)
+        await self._db.commit()
+        # Carrega tudo pra memória (consulta a cada mensagem seria custosa).
+        async with self._db.execute("SELECT guild_id, channel_id FROM canais_ia") as cur:
+            async for guild_id, channel_id in cur:
+                self._guild_channels[guild_id] = channel_id
+        async with self._db.execute("SELECT guild_id, tom FROM tons_ia") as cur:
+            async for guild_id, tom in cur:
+                self._guild_tones[guild_id] = tom
+        async with self._db.execute("SELECT guild_id, voz FROM vozes_ia") as cur:
+            async for guild_id, voz in cur:
+                self._guild_voices[guild_id] = voz
+        log.info(
+            "Config da IA carregada (%d canais, %d tons, %d vozes).",
+            len(self._guild_channels), len(self._guild_tones), len(self._guild_voices),
+        )
+
+    async def cog_unload(self):
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
+
+    # ── Qual canal a IA escuta neste servidor ──────────────────────────────
+
+    def _is_ai_channel(self, channel) -> bool:
+        """Decide se a IA deve responder neste canal.
+        Se o servidor configurou um canal específico (via !ia-canal), usa ele.
+        Senão, cai no nome padrão global (AI_CHANNEL_NAME), tolerante a acento/caixa.
+        """
+        guild = getattr(channel, "guild", None)
+        if guild is not None and guild.id in self._guild_channels:
+            return channel.id == self._guild_channels[guild.id]
+        nome = getattr(channel, "name", "") or ""
+        return _norm_channel(nome) == _norm_channel(AI_CHANNEL_NAME)
+
+    def _tone_for(self, guild_id: int | None) -> str:
+        """Retorna a chave de tonalidade configurada para o servidor (ou o padrão)."""
+        if guild_id is not None:
+            return self._guild_tones.get(guild_id, DEFAULT_TONE)
+        return DEFAULT_TONE
+
+    def _voice_id_for(self, guild_id: int | None) -> str:
+        """Retorna o id da voz TTS configurada para o servidor (ou o padrão)."""
+        chave = self._guild_voices.get(guild_id, DEFAULT_VOICE) if guild_id is not None else DEFAULT_VOICE
+        _, voice_id = VOICE_PRESETS.get(chave, VOICE_PRESETS[DEFAULT_VOICE])
+        return voice_id
 
     # ── Rate limiting ──────────────────────────────────────────────────────
 
@@ -388,11 +511,11 @@ class AI(commands.Cog, name="IA"):
 
     # ── API call com retry ─────────────────────────────────────────────────
 
-    async def _generate_with_retry(self, contents: list, max_retries: int = 3):
+    async def _generate_with_retry(self, contents: list, max_retries: int = 3, system_instruction: str | None = None):
         """Chama o Gemini com retry exponencial em erros transitórios (503/429/overload)."""
         config = types.GenerateContentConfig(
             tools=TOOLS,
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_instruction or _build_system_prompt(DEFAULT_TONE),
             temperature=0.9,
         )
         delay = 1.0
@@ -691,7 +814,9 @@ class AI(commands.Cog, name="IA"):
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        if message.channel.name != AI_CHANNEL_NAME:
+        if message.guild is None:
+            return  # IA só funciona em servidores, não em DMs
+        if not self._is_ai_channel(message.channel):
             return
         if message.content.startswith(self.bot.command_prefix):
             return
@@ -725,13 +850,16 @@ class AI(commands.Cog, name="IA"):
             await message.channel.send("🚫 Parece que você tá tentando me reprogramar, né? Não vai rolar. 😄")
             return
 
+        # Tonalidade configurada para este servidor
+        system_prompt = _build_system_prompt(self._tone_for(message.guild.id))
+
         async with message.channel.typing():
             try:
                 contents = self._build_contents(message.channel.id, user_input)
                 reply = ""
 
                 for _ in range(10):
-                    response = await self._generate_with_retry(contents)
+                    response = await self._generate_with_retry(contents, system_instruction=system_prompt)
 
                     candidate = response.candidates[0]
                     parts = candidate.content.parts
@@ -780,10 +908,11 @@ class AI(commands.Cog, name="IA"):
                     history.append(("model", reply))
 
                 if reply:
+                    voz = self._voice_id_for(message.guild.id)
                     chunks = [reply[i:i + 2000] for i in range(0, len(reply), 2000)]
                     for i, chunk in enumerate(chunks):
                         # Botão de áudio só na última parte
-                        view = TTSView(reply) if i == len(chunks) - 1 else discord.utils.MISSING
+                        view = TTSView(reply, voice=voz) if i == len(chunks) - 1 else discord.utils.MISSING
                         await message.channel.send(chunk, view=view)
 
             except Exception as e:
@@ -796,6 +925,149 @@ class AI(commands.Cog, name="IA"):
         """Limpa o histórico de conversa do canal."""
         self._history.pop(ctx.channel.id, None)
         await ctx.send("🧹 Histórico limpo!")
+
+    @commands.command(name="ia-canal", aliases=["ai-channel"])
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def set_ai_channel(self, ctx: commands.Context, canal: discord.TextChannel = None):
+        """Define em qual canal de texto a IA vai responder neste servidor."""
+        if canal is None:
+            # Mostra a configuração atual.
+            atual_id = self._guild_channels.get(ctx.guild.id)
+            if atual_id:
+                ch = ctx.guild.get_channel(atual_id)
+                onde = ch.mention if ch else f"(canal apagado — id {atual_id})"
+                desc = f"A IA está respondendo em {onde}."
+            else:
+                desc = f"A IA está usando o canal padrão: **#{AI_CHANNEL_NAME}** (nenhum canal personalizado definido)."
+            desc += "\n\nPara mudar, use `!ia-canal #canal`.\nPara voltar ao padrão, use `!ia-canal-padrao`."
+            return await ctx.send(embed=discord.Embed(
+                title="Canal da IA", description=desc, color=discord.Color.blurple()
+            ))
+
+        if self._db is None:
+            return await ctx.send("⚠️ Configuração indisponível no momento.")
+
+        await self._db.execute(
+            "INSERT INTO canais_ia (guild_id, channel_id) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id",
+            (ctx.guild.id, canal.id),
+        )
+        await self._db.commit()
+        self._guild_channels[ctx.guild.id] = canal.id
+        await ctx.send(embed=discord.Embed(
+            title="✅ Canal da IA definido",
+            description=f"A partir de agora, a IA responde em {canal.mention}.\n"
+                        f"É só mandar mensagens lá — sem precisar de comando.",
+            color=discord.Color.green(),
+        ))
+
+    @commands.command(name="ia-canal-padrao", aliases=["ai-channel-reset"])
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def reset_ai_channel(self, ctx: commands.Context):
+        """Volta a IA para o canal padrão (remove a configuração personalizada)."""
+        if self._db is None:
+            return await ctx.send("⚠️ Configuração indisponível no momento.")
+        await self._db.execute("DELETE FROM canais_ia WHERE guild_id = ?", (ctx.guild.id,))
+        await self._db.commit()
+        self._guild_channels.pop(ctx.guild.id, None)
+        await ctx.send(embed=discord.Embed(
+            title="🔄 Canal da IA resetado",
+            description=f"A IA voltou a usar o canal padrão **#{AI_CHANNEL_NAME}**.",
+            color=discord.Color.orange(),
+        ))
+
+    @commands.command(name="ia-tom", aliases=["ai-tone", "ia-tonalidade"])
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def set_ai_tone(self, ctx: commands.Context, tom: str = None):
+        """Escolhe a tonalidade com que a IA responde neste servidor."""
+        opcoes = "\n".join(f"• `{chave}` — {rotulo}" for chave, (rotulo, _) in TONE_PRESETS.items())
+
+        # Sem argumento: mostra o tom atual e as opções.
+        if tom is None:
+            atual = self._tone_for(ctx.guild.id)
+            rotulo_atual = TONE_PRESETS[atual][0]
+            return await ctx.send(embed=discord.Embed(
+                title="🎭 Tonalidade da IA",
+                description=(
+                    f"Tom atual: **{rotulo_atual}** (`{atual}`)\n\n"
+                    f"**Opções disponíveis:**\n{opcoes}\n\n"
+                    f"Para mudar: `!ia-tom <opção>` (ex: `!ia-tom formal`)."
+                ),
+                color=discord.Color.blurple(),
+            ))
+
+        tom = tom.lower().strip()
+        if tom not in TONE_PRESETS:
+            return await ctx.send(embed=discord.Embed(
+                title="Tom inválido",
+                description=f"'{tom}' não existe.\n\n**Opções disponíveis:**\n{opcoes}",
+                color=discord.Color.red(),
+            ))
+
+        if self._db is None:
+            return await ctx.send("⚠️ Configuração indisponível no momento.")
+
+        await self._db.execute(
+            "INSERT INTO tons_ia (guild_id, tom) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET tom = excluded.tom",
+            (ctx.guild.id, tom),
+        )
+        await self._db.commit()
+        self._guild_tones[ctx.guild.id] = tom
+        rotulo = TONE_PRESETS[tom][0]
+        await ctx.send(embed=discord.Embed(
+            title="✅ Tonalidade alterada",
+            description=f"Agora vou responder no tom **{rotulo}**. Isso também vale para o áudio do botão 🔊 Ouvir.",
+            color=discord.Color.green(),
+        ))
+
+    @commands.command(name="ia-voz", aliases=["ai-voice"])
+    @commands.has_permissions(manage_channels=True)
+    @commands.guild_only()
+    async def set_ai_voice(self, ctx: commands.Context, voz: str = None):
+        """Escolhe a voz do áudio (botão 🔊 Ouvir) neste servidor."""
+        opcoes = "\n".join(f"• `{chave}` — {rotulo}" for chave, (rotulo, _) in VOICE_PRESETS.items())
+
+        if voz is None:
+            atual = self._guild_voices.get(ctx.guild.id, DEFAULT_VOICE)
+            rotulo_atual = VOICE_PRESETS[atual][0]
+            return await ctx.send(embed=discord.Embed(
+                title="🎙️ Voz da IA",
+                description=(
+                    f"Voz atual: **{rotulo_atual}** (`{atual}`)\n\n"
+                    f"**Vozes disponíveis:**\n{opcoes}\n\n"
+                    f"Para mudar: `!ia-voz <opção>` (ex: `!ia-voz antonio`)."
+                ),
+                color=discord.Color.blurple(),
+            ))
+
+        voz = voz.lower().strip()
+        if voz not in VOICE_PRESETS:
+            return await ctx.send(embed=discord.Embed(
+                title="Voz inválida",
+                description=f"'{voz}' não existe.\n\n**Vozes disponíveis:**\n{opcoes}",
+                color=discord.Color.red(),
+            ))
+
+        if self._db is None:
+            return await ctx.send("⚠️ Configuração indisponível no momento.")
+
+        await self._db.execute(
+            "INSERT INTO vozes_ia (guild_id, voz) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET voz = excluded.voz",
+            (ctx.guild.id, voz),
+        )
+        await self._db.commit()
+        self._guild_voices[ctx.guild.id] = voz
+        rotulo = VOICE_PRESETS[voz][0]
+        await ctx.send(embed=discord.Embed(
+            title="✅ Voz alterada",
+            description=f"A voz do áudio agora é **{rotulo}**. Clique em 🔊 Ouvir numa resposta pra testar!",
+            color=discord.Color.green(),
+        ))
 
 
 async def setup(bot: commands.Bot):

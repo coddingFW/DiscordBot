@@ -86,19 +86,55 @@ Requer as permissões correspondentes no servidor.
 
 ---
 
-### Assistente IA (Gemini 2.5 Flash)
+### Assistente IA (Gemini)
 
-Crie um canal de texto chamado `ia` no seu servidor. Qualquer mensagem enviada nesse canal será respondida pelo Gemini.
+Por padrão, a IA responde no canal de texto chamado **`ia`**. Crie esse canal no seu servidor e pronto: **qualquer mensagem enviada nele é respondida pelo Gemini** (não precisa de comando, é só escrever normalmente).
 
 A IA pode executar ações reais no servidor, como:
 - "toca uma música do kendrick lamar"
 - "entra na sala Geral"
 - "cria um canal de voz chamado gaming"
+- "publica um resumo sobre a Física no canal material-academico"
 - "quem tá online agora?"
+
+Outros recursos:
+- **🔊 Ouvir** — cada resposta da IA tem um botão que gera o áudio (TTS) da mensagem, enviado de forma privada só pra você.
+- **Confirmação de segurança** — ações destrutivas (deletar canal, banir, expulsar) só acontecem depois que você clica em **Confirmar**.
+
+#### Comandos da IA (configuração por servidor)
+
+Estes comandos exigem permissão de **Gerenciar Canais** e valem só para o servidor onde forem usados:
 
 | Comando | Descrição |
 |---|---|
-| `!ia-limpar` | Limpa o histórico de conversa do canal |
+| `!ia-limpar` | Limpa o histórico de conversa do canal (a IA "esquece" o papo anterior) |
+| `!ia-canal #canal` | Define em qual canal a IA responde neste servidor |
+| `!ia-canal` | Mostra qual canal está configurado |
+| `!ia-canal-padrao` | Volta a IA para o canal padrão (`ia`) |
+| `!ia-tom <opção>` | Muda a tonalidade: `informal`, `formal`, `neutro`, `tecnico`, `divertido` |
+| `!ia-tom` | Mostra o tom atual e lista as opções |
+| `!ia-voz <opção>` | Muda a voz do áudio: `thalita`, `francisca`, `giovanna`, `leticia`, `antonio`, `fabio`, `humberto` |
+| `!ia-voz` | Mostra a voz atual e lista as opções |
+
+> **Tom × Voz:** o *tom* muda **como** a IA escreve (e o áudio acompanha, pois lê o texto); a *voz* muda **o timbre** de quem lê o áudio. Dá pra combinar (ex: `!ia-tom formal` + `!ia-voz humberto`).
+
+#### Primeiros passos (depois de adicionar o bot pelo link)
+
+1. **Adicione o bot** ao servidor pelo link de convite (precisa de permissão de Gerenciar Servidor).
+2. **Crie um canal de texto** com o nome que quiser — `ia`, `robô`, `assistente`, etc.
+3. Se o nome **não** for `ia`, avise o bot qual canal usar:
+   ```
+   !ia-canal #seu-canal
+   ```
+   (Se usar `ia`, nem precisa: já funciona por padrão.)
+4. **(Opcional)** ajuste o estilo e a voz:
+   ```
+   !ia-tom formal
+   !ia-voz antonio
+   ```
+5. Pronto! Escreva qualquer mensagem no canal e a IA responde.
+
+> 💡 Cada servidor tem sua própria configuração (canal, tom e voz), salva e mantida entre reinicializações.
 
 ---
 
@@ -134,7 +170,24 @@ DISCORD_TOKEN=seu_token_aqui
 BOT_PREFIX=!
 GOOGLE_API_KEY=sua_chave_gemini_aqui
 AI_CHANNEL_NAME=ia
+AI_MODEL=gemini-2.5-flash
+LOG_CHANNEL_NAME=logs
+SPOTIPY_CLIENT_ID=seu_client_id_aqui
+SPOTIPY_CLIENT_SECRET=seu_client_secret_aqui
 ```
+
+| Variável | Obrigatória? | O que faz |
+|---|---|---|
+| `DISCORD_TOKEN` | ✅ Sim | Token do bot (Discord Developer Portal) |
+| `BOT_PREFIX` | Não (padrão `!`) | Símbolo dos comandos: `!ping`, `!m`... |
+| `GOOGLE_API_KEY` | Pra IA | Chave do Gemini ([Google AI Studio](https://aistudio.google.com/apikey)) |
+| `AI_CHANNEL_NAME` | Não (padrão `ia`) | **Nome do canal onde a IA responde.** Troque pra usar outro canal (ex: `Robô`) |
+| `AI_MODEL` | Não (padrão `gemini-2.5-flash`) | Versão do Gemini. Se uma versão der erro de cota, tente outra |
+| `LOG_CHANNEL_NAME` | Não (padrão `logs`) | Canal onde os logs de moderação são registrados |
+| `SPOTIPY_CLIENT_ID` / `_SECRET` | Não | Pra tocar links do Spotify (opcional) |
+
+> Não use aspas nem espaços ao redor do `=`. Certo: `AI_CHANNEL_NAME=Robô`. Errado: `AI_CHANNEL_NAME = "Robô"`.
+> Toda vez que mudar o `.env`, **reinicie o bot** pra valer.
 
 ### Executando
 
