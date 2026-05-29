@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import time
+import aiohttp
 import discord
 from discord.ext import commands
 import yt_dlp
@@ -64,6 +66,35 @@ except ImportError:
 
 _SP_ID = os.getenv("SPOTIPY_CLIENT_ID")
 _SP_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
+
+# Headers para o scraping do Spotify (página pública /embed/)
+_SCRAPE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+
+
+def _find_first(obj, key: str):
+    """Busca recursiva pela primeira chave `key` em uma estrutura JSON."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            result = _find_first(v, key)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_first(item, key)
+            if result is not None:
+                return result
+    return None
 
 
 def music_embed(title: str, description: str, color=discord.Color.blurple()) -> discord.Embed:
@@ -229,14 +260,47 @@ class Music(commands.Cog, name="Música"):
     # ── Extração de Spotify ───────────────────────────────────────────────
 
     async def _extract_spotify(self, url: str) -> list[dict]:
-        """Converte um link do Spotify em uma lista de queries para busca no YouTube."""
-        if not self._sp:
-            return []
+        """Converte um link do Spotify em uma lista de queries para busca no YouTube.
 
+        Tenta a API oficial primeiro. Se falhar (403, sem credenciais, etc.),
+        cai para o scraping da página pública /embed/.
+        """
         match = _SPOTIFY_RE.match(url)
         if not match:
             return []
         resource_type = match.group(1)
+        resource_id = match.group(2)
+
+        queries: list[str] = []
+
+        # 1) Tenta API oficial
+        if self._sp:
+            try:
+                queries = await self._spotify_via_api(url, resource_type)
+            except Exception as e:
+                log.warning("API do Spotify falhou (%s) — caindo para scraping.", e)
+
+        # 2) Fallback: scraping da página pública
+        if not queries:
+            try:
+                queries = await self._spotify_via_scrape(resource_type, resource_id)
+            except Exception as e:
+                log.error("Scraping do Spotify falhou: %s", e)
+                raise RuntimeError(f"Não consegui ler a playlist do Spotify: {e}")
+
+        return [{
+            "title": q,
+            "url": "",
+            "duration": 0,
+            "thumbnail": "",
+            "uploader": "Spotify",
+            "source": "",
+            "_needs_fetch": True,
+            "_query": q,
+        } for q in queries]
+
+    async def _spotify_via_api(self, url: str, resource_type: str) -> list[str]:
+        """Extrai queries via API oficial do Spotify (requer Premium no app owner)."""
         loop = asyncio.get_running_loop()
 
         def _fetch() -> list[str]:
@@ -310,14 +374,20 @@ class Music(commands.Cog, name="Música"):
 
         async def _preload():
             next_song = state.queue[0]
+            # Música não-lazy já está resolvida — nada a fazer.
+            if not next_song.get("_needs_fetch"):
+                return
             query = next_song.get("_query") or next_song.get("url") or next_song.get("title", "")
             if not query:
                 return
             try:
                 result = await self._search(query)
-                if result and not next_song.get("_needs_fetch"):
-                    state._preloaded = result
-                log.debug("Pré-carregado: '%s'", (result or {}).get("title", ""))
+                if result:
+                    # Resolve a próxima faixa no próprio objeto da fila,
+                    # eliminando o gap quando ela virar a atual.
+                    next_song.update(result)
+                    next_song["_needs_fetch"] = False
+                    log.debug("Pré-carregado: '%s'", result.get("title", ""))
             except Exception as e:
                 log.debug("Erro no pré-carregamento: %s", e)
 
@@ -364,18 +434,8 @@ class Music(commands.Cog, name="Música"):
             state._inactivity_task = self.bot.loop.create_task(self._auto_disconnect(ctx))
             return
 
-        # Usa pré-carregado se disponível e compatível
-        next_song = state.queue[0]
-        if (
-            state._preloaded
-            and not next_song.get("_needs_fetch")
-            and state._preloaded.get("title") == next_song.get("title")
-        ):
-            state.current = state._preloaded
-            state._preloaded = None
-        else:
-            state.current = next_song
-        state.queue.pop(0)
+        # A próxima faixa pode já ter sido resolvida pelo pré-carregamento.
+        state.current = state.queue.pop(0)
 
         self._schedule_preload(state)
 
@@ -520,8 +580,14 @@ class Music(commands.Cog, name="Música"):
                 try:
                     songs = await self._extract_spotify(query)
                 except Exception as e:
+                    log.error("Erro ao carregar do Spotify: %s", e)
                     await msg.delete()
-                    return await ctx.send(embed=music_embed("Erro no Spotify", f"`{e}`", discord.Color.red()))
+                    return await ctx.send(embed=music_embed(
+                        "Erro no Spotify",
+                        "Não consegui carregar esse link do Spotify 😕\n"
+                        "Confere se o link tá certo e tenta de novo.",
+                        discord.Color.red(),
+                    ))
             await msg.delete()
 
             if not songs:
@@ -674,6 +740,9 @@ class Music(commands.Cog, name="Música"):
                 embed=music_embed("Devagar aí!", f"Aguarde {error.retry_after:.1f}s.", discord.Color.orange()),
                 delete_after=5,
             )
+        else:
+            # Deixa o handler global tratar (mensagem amigável + log).
+            raise error
 
 
 async def setup(bot: commands.Bot):

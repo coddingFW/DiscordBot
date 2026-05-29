@@ -2,16 +2,22 @@ import os
 import time
 import logging
 import re
+import asyncio
+import tempfile
 from collections import deque
 import discord
 from discord.ext import commands
 from google import genai
 from google.genai import types
+import edge_tts
 
 log = logging.getLogger("cog.ai")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 AI_CHANNEL_NAME = os.getenv("AI_CHANNEL_NAME", "ia")
+TTS_VOICE = os.getenv("TTS_VOICE", "pt-BR-ThalitaNeural")
+TTS_RATE = os.getenv("TTS_RATE", "-3%")   # leve desaceleração soa mais natural
+TTS_PITCH = os.getenv("TTS_PITCH", "+2Hz")
 MODEL_NAME = "gemini-2.5-flash"
 MAX_HISTORY = 20
 RATE_LIMIT = 5          # mensagens
@@ -29,6 +35,68 @@ _INJECTION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+def _is_daily_quota(msg: str) -> bool:
+    """True se o erro for o limite DIÁRIO da cota (não adianta tentar de novo hoje)."""
+    m = msg.lower()
+    return "429" in m and any(
+        s in m for s in ("perday", "per day", "generaterequestsperday", "daily", "resource_exhausted", "quota")
+    )
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Traduz uma exceção técnica da API em uma mensagem clara para o usuário."""
+    msg = str(exc).lower()
+
+    # Cota diária esgotada (free tier = 20 req/dia). Retry não resolve.
+    if _is_daily_quota(msg):
+        return (
+            "📉 **Bati no limite diário de uso da IA.**\n"
+            "A chave gratuita do Gemini permite um número limitado de perguntas por dia, "
+            "e ele já acabou por hoje. Tenta de novo amanhã que o limite reseta! 🙏"
+        )
+
+    # Excesso de requisições em pouco tempo (rate limit por minuto).
+    if "429" in msg or "rate" in msg:
+        return (
+            "⏳ **Tô recebendo perguntas rápido demais!**\n"
+            "Espera alguns segundinhos e manda de novo, por favor."
+        )
+
+    # Servidor do Gemini sobrecarregado / indisponível.
+    if any(s in msg for s in ("503", "unavailable", "overload", "high demand")):
+        return (
+            "🛠️ **O servidor da IA tá sobrecarregado agora.**\n"
+            "Não é culpa sua — tenta mandar a pergunta de novo daqui a pouquinho."
+        )
+
+    # Erro interno do servidor.
+    if "500" in msg or "internal" in msg:
+        return (
+            "💥 **Deu um erro interno na IA.**\n"
+            "Foi um problema do lado deles. Tenta de novo em instantes."
+        )
+
+    # Problema de autenticação / chave de API.
+    if any(s in msg for s in ("401", "403", "api key", "permission", "unauthenticated", "invalid_argument")):
+        return (
+            "🔑 **Tem algo errado com a configuração da IA.**\n"
+            "Provavelmente a chave de API. Avisa quem cuida do bot, por favor."
+        )
+
+    # Problema de rede / tempo esgotado.
+    if any(s in msg for s in ("timeout", "timed out", "connection", "network", "deadline")):
+        return (
+            "📡 **Não consegui falar com o servidor da IA.**\n"
+            "Pode ter sido a conexão. Tenta de novo daqui a pouco."
+        )
+
+    # Genérico — não vaza o JSON cru pro usuário.
+    return (
+        "😅 **Deu um probleminha inesperado ao responder.**\n"
+        "Tenta de novo? Se continuar, avisa quem cuida do bot."
+    )
+
+
 SYSTEM_PROMPT = """Você é o Good Vibes, assistente do servidor Discord.
 Fale sempre de forma informal, descontraída, como papo entre amigos.
 Use gírias brasileiras, emojis quando fizer sentido, mas sem exagerar.
@@ -36,9 +104,11 @@ Respostas curtas — ninguém quer textão.
 Se o papo for engraçado, entra na brincadeira.
 Responda sempre em português do Brasil.
 
+Você sabe de tudo — história, ciência, cultura pop, tecnologia, curiosidades, o que for. Responda qualquer pergunta normalmente, como um amigo bem informado.
+
 Você foi criado por coddingFW. Se alguém perguntar quem te criou ou te desenvolveu, fala que foi o coddingFW e manda o perfil dele no GitHub: https://github.com/coddingFW
 
-Você tem ferramentas para agir no servidor. Quando o usuário pedir algo que envolva música, canais ou moderação, USE as ferramentas — não explique como fazer, FAÇA."""
+Você também tem ferramentas para agir no servidor. Quando o usuário pedir algo que envolva música, canais ou moderação, USE as ferramentas — não explique como fazer, FAÇA."""
 
 TOOLS = [
     types.Tool(function_declarations=[
@@ -183,6 +253,64 @@ TOOLS = [
 _DESTRUCTIVE = {"kick_membro", "ban_membro", "desbanir_membro", "desmutar_membro", "deletar_canal"}
 
 
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # símbolos, pictogramas, emojis
+    "\U00002600-\U000027BF"  # misc symbols + dingbats
+    "\U0001F1E6-\U0001F1FF"  # bandeiras
+    "\U00002190-\U000021FF"  # setas
+    "\U00002B00-\U00002BFF"  # setas/símbolos extras
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0000200D"             # zero-width joiner
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _clean_for_tts(text: str) -> str:
+    """Remove emojis/símbolos e normaliza espaços para uma fala mais natural."""
+    text = _EMOJI_RE.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+async def _tts_to_file(text: str) -> str:
+    """Gera áudio TTS e retorna o caminho do arquivo mp3 temporário."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        tmp_path = f.name
+    clean = _clean_for_tts(text) or "Sem texto para ler."
+    communicate = edge_tts.Communicate(clean, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
+    await communicate.save(tmp_path)
+    return tmp_path
+
+
+class TTSView(discord.ui.View):
+    def __init__(self, text: str):
+        super().__init__(timeout=120)
+        self.text = text
+
+    @discord.ui.button(label="🔊 Ouvir", style=discord.ButtonStyle.secondary)
+    async def ouvir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        tmp_path = None
+        try:
+            tmp_path = await _tts_to_file(self.text)
+            await interaction.followup.send(
+                file=discord.File(tmp_path, filename="resposta.mp3"),
+                ephemeral=True,
+            )
+        except Exception as e:
+            log.error("Erro no TTS: %s", e)
+            await interaction.followup.send(f"Erro ao gerar áudio: `{e}`", ephemeral=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
 class ConfirmView(discord.ui.View):
     def __init__(self, timeout: float = 30.0):
         super().__init__(timeout=timeout)
@@ -230,6 +358,40 @@ class AI(commands.Cog, name="IA"):
             return False
         self._rate[user_id].append(now)
         return True
+
+    # ── API call com retry ─────────────────────────────────────────────────
+
+    async def _generate_with_retry(self, contents: list, max_retries: int = 3):
+        """Chama o Gemini com retry exponencial em erros transitórios (503/429/overload)."""
+        config = types.GenerateContentConfig(
+            tools=TOOLS,
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.9,
+        )
+        delay = 1.0
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                return await self._client.aio.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                # Cota diária esgotada: tentar de novo não adianta, sobe na hora.
+                if _is_daily_quota(msg):
+                    raise
+                transient = any(
+                    s in msg for s in ("503", "429", "unavailable", "overload", "high demand", "try again")
+                )
+                if not transient or attempt == max_retries - 1:
+                    raise
+                last_exc = e
+                log.warning("Erro transitório do Gemini (tentativa %d/%d): %s", attempt + 1, max_retries, e)
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise last_exc  # nunca alcançado, mas explícito
 
     # ── History helpers ────────────────────────────────────────────────────
 
@@ -509,15 +671,7 @@ class AI(commands.Cog, name="IA"):
                 reply = ""
 
                 for _ in range(10):
-                    response = await self._client.aio.models.generate_content(
-                        model=MODEL_NAME,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            tools=TOOLS,
-                            system_instruction=SYSTEM_PROMPT,
-                            temperature=0.9,
-                        )
-                    )
+                    response = await self._generate_with_retry(contents)
 
                     candidate = response.candidates[0]
                     parts = candidate.content.parts
@@ -566,12 +720,15 @@ class AI(commands.Cog, name="IA"):
                     history.append(("model", reply))
 
                 if reply:
-                    for i in range(0, len(reply), 2000):
-                        await message.channel.send(reply[i:i + 2000])
+                    chunks = [reply[i:i + 2000] for i in range(0, len(reply), 2000)]
+                    for i, chunk in enumerate(chunks):
+                        # Botão de áudio só na última parte
+                        view = TTSView(reply) if i == len(chunks) - 1 else discord.utils.MISSING
+                        await message.channel.send(chunk, view=view)
 
             except Exception as e:
                 log.error("Erro na API do Gemini: %s", e)
-                await message.channel.send(f"Ih, deu ruim aqui 😅 — `{e}`")
+                await message.channel.send(_friendly_error(e))
 
     @commands.command(name="ia-limpar", aliases=["ai-clear"])
     @commands.has_permissions(manage_messages=True)

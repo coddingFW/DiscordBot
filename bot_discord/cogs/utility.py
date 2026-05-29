@@ -43,7 +43,8 @@ class Utility(commands.Cog, name="Utilitários"):
     async def serverinfo(self, ctx: commands.Context):
         g = ctx.guild
         embed = discord.Embed(title=g.name, color=discord.Color.blurple())
-        embed.set_thumbnail(url=g.icon.url if g.icon else discord.Embed.Empty)
+        if g.icon:
+            embed.set_thumbnail(url=g.icon.url)
         embed.add_field(name="Dono", value=g.owner.mention)
         embed.add_field(name="Membros", value=g.member_count)
         embed.add_field(name="Canais de texto", value=len(g.text_channels))

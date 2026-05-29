@@ -157,11 +157,51 @@ class DiscordBot(commands.Bot):
                     color=discord.Color.red(),
                 )
             )
+        elif isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"⏳ Calma aí! Espera **{error.retry_after:.0f}s** antes de usar `{ctx.command}` de novo.",
+                    color=discord.Color.orange(),
+                )
+            )
+        elif isinstance(error, (commands.BadArgument, commands.BadUnionArgument)):
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"Argumento inválido. Use `{self.command_prefix}help {ctx.command}` para ver o uso correto.",
+                    color=discord.Color.orange(),
+                )
+            )
+        elif isinstance(error, commands.NoPrivateMessage):
+            await ctx.send(
+                embed=discord.Embed(
+                    description="Este comando só funciona dentro de um servidor.",
+                    color=discord.Color.orange(),
+                )
+            )
+        elif isinstance(error, commands.NotOwner):
+            await ctx.send(
+                embed=discord.Embed(
+                    description="Só o dono do bot pode usar este comando.",
+                    color=discord.Color.red(),
+                )
+            )
+        elif isinstance(error, commands.CheckFailure):
+            await ctx.send(
+                embed=discord.Embed(
+                    description="Você não pode usar este comando aqui.",
+                    color=discord.Color.red(),
+                )
+            )
         else:
+            # Erro inesperado: loga o detalhe técnico, mas mostra mensagem clara.
             log.error("Erro no comando '%s': %s", ctx.command, error)
             await ctx.send(
                 embed=discord.Embed(
-                    description=f"Ocorreu um erro inesperado: `{error}`",
+                    description=(
+                        "💥 **Ops, algo deu errado ao executar esse comando.**\n"
+                        "Não é culpa sua — tenta de novo daqui a pouco. "
+                        "Se continuar, avisa quem cuida do bot."
+                    ),
                     color=discord.Color.red(),
                 )
             )

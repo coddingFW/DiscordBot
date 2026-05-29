@@ -7,3 +7,8 @@ __pycache__/
 *.log
 .vscode/
 .idea/
+
+# Dados locais / cache gerados em runtime
+playlists.db
+.cache
+.pytest_cache/
