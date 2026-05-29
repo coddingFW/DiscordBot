@@ -1,5 +1,8 @@
 # Good Vibes — Bot Discord
 
+[![Testes](https://github.com/coddingFW/DiscordBot/actions/workflows/tests.yml/badge.svg)](https://github.com/coddingFW/DiscordBot/actions/workflows/tests.yml)
+[![Cobertura](https://codecov.io/gh/coddingFW/DiscordBot/graph/badge.svg)](https://codecov.io/gh/coddingFW/DiscordBot)
+
 Bot multifuncional para Discord com música, moderação, playlists e assistente de IA (Gemini).
 
 ---
@@ -67,7 +70,12 @@ Requer as permissões correspondentes no servidor.
 | `!purge <1-100>` | Apaga até 100 mensagens |
 | `!mute @membro [motivo]` | Silencia um membro |
 | `!unmute @membro` | Remove o silêncio |
-| `!warn @membro <motivo>` | Envia aviso por DM |
+| `!warn @membro <motivo>` | Registra aviso (histórico persistente, DM automática) |
+| `!warns @membro` | Exibe o histórico completo de avisos |
+| `!delwarn <id>` | Remove um aviso específico pelo ID |
+| `!clearwarns @membro` | Apaga todos os avisos do membro (admin) |
+
+> **Ações automáticas:** 3 avisos → mute automático · 5 avisos → ban automático. Tudo registrado no canal de logs.
 
 ---
 
