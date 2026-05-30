@@ -10,10 +10,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: bot_discord
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,10 +22,14 @@ jobs:
           cache-dependency-path: bot_discord/requirements*.txt
 
       - name: Instalar dependências
+        working-directory: bot_discord
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Rodar testes com cobertura
-        run: PYTHONPATH=. pytest --tb=short -q --cov=cogs --cov=bot --cov-report=xml --cov-report=term-missing
+        working-directory: bot_discord
+        env:
+          PYTHONPATH: ${{ github.workspace }}/bot_discord
+        run: pytest --tb=short -q --cov=cogs --cov=bot --cov-report=xml --cov-report=term-missing
 
       - name: Enviar cobertura ao Codecov
         uses: codecov/codecov-action@v5
