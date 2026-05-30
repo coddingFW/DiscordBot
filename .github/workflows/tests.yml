@@ -29,7 +29,7 @@ jobs:
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Rodar testes com cobertura
-        run: pytest --tb=short -q --cov=cogs --cov=bot --cov-report=xml --cov-report=term-missing
+        run: PYTHONPATH=. pytest --tb=short -q --cov=cogs --cov=bot --cov-report=xml --cov-report=term-missing
 
       - name: Enviar cobertura ao Codecov
         uses: codecov/codecov-action@v5
