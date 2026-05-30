@@ -11,5 +11,9 @@ __pycache__/
 # Dados locais / cache gerados em runtime
 playlists.db
 ai_config.db
+warns.db
 .cache
 .pytest_cache/
+
+# Documentos locais — não subir
+ROADMAP_COMPETITIVO.md
