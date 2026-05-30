@@ -155,66 +155,50 @@ async def test_purge_quantidade_invalida(cog):
 
 # ── mute ──────────────────────────────────────────────────────────────────────
 
-async def test_mute_adiciona_cargo(cog):
-    guild = make_guild()
-    muted_role = MagicMock()
-    muted_role.name = "Muted"
-    guild.roles = [muted_role]
-
+async def test_mute_adiciona_timeout(cog):
     member = make_member()
-    member.roles = []
-    ctx = make_ctx(guild=guild)
-
-    with patch("discord.utils.get", return_value=muted_role), \
-         patch("cogs.moderation.send_log", new=AsyncMock()):
-        await Moderation.mute.callback(cog, ctx, member, reason="barulho")
-
-    member.add_roles.assert_called_once_with(muted_role, reason="barulho")
+    member.timeout = AsyncMock()
+    ctx = make_ctx()
+    with patch("cogs.moderation.send_log", new=AsyncMock()):
+        await Moderation.mute.callback(cog, ctx, member, duracao="1h", motivo="barulho")
+    member.timeout.assert_called_once()
 
 
-async def test_mute_ja_silenciado(cog):
-    guild = make_guild()
-    muted_role = MagicMock()
-    muted_role.name = "Muted"
-
+async def test_mute_aplica_timeout(cog):
     member = make_member()
-    member.roles = [muted_role]
-    ctx = make_ctx(guild=guild)
+    member.timeout = AsyncMock()
+    ctx = make_ctx()
+    with patch("cogs.moderation.send_log", new=AsyncMock()):
+        await Moderation.mute.callback(cog, ctx, member, duracao="10m", motivo="teste")
+    member.timeout.assert_called_once()
 
-    with patch("discord.utils.get", return_value=muted_role):
-        await Moderation.mute.callback(cog, ctx, member, reason="teste")
 
-    member.add_roles.assert_not_called()
-    embed = ctx.send.call_args.kwargs.get("embed") or ctx.send.call_args.args[0]
-    assert "já está" in embed.description
+async def test_mute_duracao_invalida_usa_padrao(cog):
+    member = make_member()
+    member.timeout = AsyncMock()
+    ctx = make_ctx()
+    with patch("cogs.moderation.send_log", new=AsyncMock()):
+        # "spam" não é duração válida — deve usar 28d e incluir "spam" no motivo
+        await Moderation.mute.callback(cog, ctx, member, duracao="spam", motivo="repetitivo")
+    member.timeout.assert_called_once()
 
 
 # ── unmute ────────────────────────────────────────────────────────────────────
 
-async def test_unmute_remove_cargo(cog):
-    guild = make_guild()
-    muted_role = MagicMock()
-    muted_role.name = "Muted"
-
+async def test_unmute_remove_timeout(cog):
     member = make_member()
-    member.roles = [muted_role]
-    ctx = make_ctx(guild=guild)
-
-    with patch("discord.utils.get", return_value=muted_role), \
-         patch("cogs.moderation.send_log", new=AsyncMock()):
+    member.timeout = AsyncMock()
+    member.is_timed_out = MagicMock(return_value=True)
+    ctx = make_ctx()
+    with patch("cogs.moderation.send_log", new=AsyncMock()):
         await Moderation.unmute.callback(cog, ctx, member)
-
-    member.remove_roles.assert_called_once_with(muted_role)
+    assert member.timeout.called
 
 
 async def test_unmute_nao_silenciado(cog):
-    guild = make_guild()
     member = make_member()
-    member.roles = []
-    ctx = make_ctx(guild=guild)
-
-    with patch("discord.utils.get", return_value=None):
-        await Moderation.unmute.callback(cog, ctx, member)
-
+    member.is_timed_out = MagicMock(return_value=False)
+    ctx = make_ctx()
+    await Moderation.unmute.callback(cog, ctx, member)
     embed = ctx.send.call_args.kwargs.get("embed") or ctx.send.call_args.args[0]
     assert "não está" in embed.description

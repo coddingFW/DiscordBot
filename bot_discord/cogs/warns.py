@@ -1,10 +1,11 @@
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .logs import send_log, log_embed
@@ -13,7 +14,6 @@ log = logging.getLogger("cog.warns")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "warns.db")
 
-# Warn count → ação automática ("mute" ou "ban")
 WARN_THRESHOLDS: dict[int, str] = {3: "mute", 5: "ban"}
 
 
@@ -22,7 +22,7 @@ def _embed(title: str, description: str = "", color=discord.Color.orange()) -> d
 
 
 class Warns(commands.Cog, name="Avisos"):
-    """Histórico persistente de avisos com ações automáticas."""
+    """Historico persistente de avisos com acoes automaticas."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -51,13 +51,12 @@ class Warns(commands.Cog, name="Avisos"):
     async def _apply_auto_action(self, ctx: commands.Context, member: discord.Member, total: int):
         action = WARN_THRESHOLDS.get(total)
         if action == "mute":
-            muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
-            if not muted_role:
-                muted_role = await ctx.guild.create_role(name="Muted")
-                for channel in ctx.guild.channels:
-                    await channel.set_permissions(muted_role, send_messages=False, speak=False)
-            if muted_role not in member.roles:
-                await member.add_roles(muted_role, reason=f"Auto-mute: {total} avisos")
+            # Usa timeout nativo do Discord (28d)
+            try:
+                until = datetime.now(timezone.utc) + timedelta(days=28)
+                await member.timeout(until, reason=f"Auto-mute: {total} avisos")
+            except discord.Forbidden:
+                pass
             await ctx.send(embed=_embed(
                 "Auto-mute aplicado",
                 f"{member.mention} foi silenciado automaticamente por atingir **{total} avisos**.",
@@ -81,9 +80,10 @@ class Warns(commands.Cog, name="Avisos"):
                 Avisos=str(total),
             ))
 
-    @commands.command(name="warn", help="Registra um aviso para um membro (histórico persistente).")
+    @commands.hybrid_command(name="warn", help="Registra um aviso para um membro (historico persistente).")
     @commands.has_permissions(manage_messages=True)
     @commands.guild_only()
+    @app_commands.describe(member="Membro a avisar", reason="Motivo do aviso")
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
         ts = int(time.time())
         await self._db.execute(
@@ -101,15 +101,15 @@ class Warns(commands.Cog, name="Avisos"):
         try:
             await member.send(embed=discord.Embed(
                 title=f"Aviso em {ctx.guild.name}",
-                description=f"Você recebeu um aviso ({total}º).\n**Motivo:** {reason}",
+                description=f"Voce recebeu um aviso ({total}o).\n**Motivo:** {reason}",
                 color=discord.Color.orange(),
             ))
             dm_note = ""
         except discord.Forbidden:
-            dm_note = "\n*(DM bloqueada — membro não foi notificado)*"
+            dm_note = "\n*(DM bloqueada — membro nao foi notificado)*"
 
         next_action = WARN_THRESHOLDS.get(total + 1)
-        proximo = f"\n⚠️ Próximo aviso: **{next_action}** automático." if next_action else ""
+        proximo = f"\n⚠️ Proximo aviso: **{next_action}** automatico." if next_action else ""
 
         await ctx.send(embed=_embed(
             f"Aviso #{total} registrado",
@@ -125,9 +125,10 @@ class Warns(commands.Cog, name="Avisos"):
 
         await self._apply_auto_action(ctx, member, total)
 
-    @commands.command(name="warns", aliases=["infrações", "historico"], help="Mostra o histórico de avisos de um membro.")
+    @commands.hybrid_command(name="warns", aliases=["historico"], help="Mostra o historico de avisos de um membro.")
     @commands.has_permissions(manage_messages=True)
     @commands.guild_only()
+    @app_commands.describe(member="Membro para ver o historico")
     async def list_warns(self, ctx: commands.Context, member: discord.Member):
         async with self._db.execute(
             "SELECT id, mod_id, reason, timestamp FROM warns "
@@ -157,9 +158,10 @@ class Warns(commands.Cog, name="Avisos"):
         embed.set_footer(text=f"Total: {len(rows)} aviso(s)")
         await ctx.send(embed=embed)
 
-    @commands.command(name="delwarn", aliases=["removerwarn"], help="Remove um aviso específico pelo ID.")
+    @commands.hybrid_command(name="delwarn", aliases=["removerwarn"], help="Remove um aviso especifico pelo ID.")
     @commands.has_permissions(manage_messages=True)
     @commands.guild_only()
+    @app_commands.describe(warn_id="ID do aviso a remover")
     async def del_warn(self, ctx: commands.Context, warn_id: int):
         async with self._db.execute(
             "SELECT user_id FROM warns WHERE id = ? AND guild_id = ?",
@@ -168,7 +170,7 @@ class Warns(commands.Cog, name="Avisos"):
             row = await cur.fetchone()
 
         if not row:
-            return await ctx.send(embed=_embed("Erro", f"Aviso `#{warn_id}` não encontrado.", discord.Color.red()))
+            return await ctx.send(embed=_embed("Erro", f"Aviso `#{warn_id}` nao encontrado.", discord.Color.red()))
 
         user_id = row[0]
         await self._db.execute("DELETE FROM warns WHERE id = ?", (warn_id,))
@@ -180,9 +182,10 @@ class Warns(commands.Cog, name="Avisos"):
         ))
         log.info("%s removeu o aviso #%d de user_id=%d", ctx.author, warn_id, user_id)
 
-    @commands.command(name="clearwarns", aliases=["limpar-avisos"], help="Remove todos os avisos de um membro (admin).")
+    @commands.hybrid_command(name="clearwarns", aliases=["limpar-avisos"], help="Remove todos os avisos de um membro (admin).")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
+    @app_commands.describe(member="Membro para limpar os avisos")
     async def clear_warns(self, ctx: commands.Context, member: discord.Member):
         await self._db.execute(
             "DELETE FROM warns WHERE guild_id = ? AND user_id = ?",

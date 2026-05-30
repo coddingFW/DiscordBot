@@ -19,6 +19,7 @@ COGS = [
     "cogs.music",
     "cogs.moderation",
     "cogs.warns",
+    "cogs.automod",
     "cogs.utility",
     "cogs.playlist",
     "cogs.ai",
@@ -68,6 +69,13 @@ class DiscordBot(commands.Bot):
         # Limpa sessões de voz antigas para evitar erro 4017
         for guild in self.guilds:
             await guild.change_voice_state(channel=None)
+
+        # Sincroniza slash commands globalmente (pode levar até 1h na 1ª vez)
+        try:
+            synced = await self.tree.sync()
+            log.info("Slash commands sincronizados: %d comandos", len(synced))
+        except Exception as e:
+            log.warning("Falha ao sincronizar slash commands: %s", e)
 
         await self.change_presence(
             activity=discord.Activity(

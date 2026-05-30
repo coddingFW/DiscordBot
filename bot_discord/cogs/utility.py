@@ -19,14 +19,14 @@ class Utility(commands.Cog, name="Utilitários"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="ping", help="Mostra a latência do bot.")
+    @commands.hybrid_command(name="ping", help="Mostra a latência do bot.")
     async def ping(self, ctx: commands.Context):
         latency = round(self.bot.latency * 1000)
         color = discord.Color.green() if latency < 100 else discord.Color.orange() if latency < 200 else discord.Color.red()
         embed = discord.Embed(title="Pong!", description=f"Latência: **{latency}ms**", color=color)
         await ctx.send(embed=embed)
 
-    @commands.command(name="uptime", help="Mostra há quanto tempo o bot está online.")
+    @commands.hybrid_command(name="uptime", help="Mostra há quanto tempo o bot está online.")
     async def uptime(self, ctx: commands.Context):
         elapsed = int(time.time() - _START_TIME)
         h, rem = divmod(elapsed, 3600)
@@ -38,7 +38,7 @@ class Utility(commands.Cog, name="Utilitários"):
         )
         await ctx.send(embed=embed)
 
-    @commands.command(name="serverinfo", aliases=["servidor"], help="Informações do servidor.")
+    @commands.hybrid_command(name="serverinfo", aliases=["servidor"], help="Informações do servidor.")
     @commands.guild_only()
     async def serverinfo(self, ctx: commands.Context):
         g = ctx.guild
@@ -56,7 +56,7 @@ class Utility(commands.Cog, name="Utilitários"):
         embed.set_footer(text=f"ID: {g.id}")
         await ctx.send(embed=embed)
 
-    @commands.command(name="userinfo", aliases=["usuario", "perfil"], help="Informações de um usuário.")
+    @commands.hybrid_command(name="userinfo", aliases=["usuario", "perfil"], help="Informações de um usuário.")
     @commands.guild_only()
     async def userinfo(self, ctx: commands.Context, member: discord.Member = None):
         member = member or ctx.author
@@ -71,14 +71,14 @@ class Utility(commands.Cog, name="Utilitários"):
         embed.add_field(name=f"Cargos ({len(member.roles) - 1})", value=" ".join(roles[:10]), inline=False)
         await ctx.send(embed=embed)
 
-    @commands.command(name="avatar", help="Exibe o avatar de um usuário.")
+    @commands.hybrid_command(name="avatar", help="Exibe o avatar de um usuário.")
     async def avatar(self, ctx: commands.Context, member: discord.Member = None):
         member = member or ctx.author
         embed = discord.Embed(title=f"Avatar de {member.display_name}", color=discord.Color.blurple())
         embed.set_image(url=member.display_avatar.url)
         await ctx.send(embed=embed)
 
-    @commands.command(name="botinfo", aliases=["sobre"], help="Informações sobre o bot.")
+    @commands.hybrid_command(name="botinfo", aliases=["sobre"], help="Informações sobre o bot.")
     async def botinfo(self, ctx: commands.Context):
         embed = discord.Embed(title=self.bot.user.name, color=discord.Color.blurple())
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
@@ -90,16 +90,22 @@ class Utility(commands.Cog, name="Utilitários"):
         embed.add_field(name="Latência", value=f"{round(self.bot.latency * 1000)}ms")
         await ctx.send(embed=embed)
 
-    @commands.command(name="say", help="Faz o bot enviar uma mensagem no canal.")
+    @commands.hybrid_command(name="say", help="Faz o bot enviar uma mensagem no canal.")
     @commands.has_permissions(manage_messages=True)
     async def say(self, ctx: commands.Context, *, message: str):
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         await ctx.send(message)
 
-    @commands.command(name="embed", help="Envia uma mensagem formatada como embed.")
+    @commands.hybrid_command(name="embed", help="Envia uma mensagem formatada como embed.")
     @commands.has_permissions(manage_messages=True)
     async def send_embed(self, ctx: commands.Context, title: str, *, description: str):
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         await ctx.send(embed=discord.Embed(title=title, description=description, color=discord.Color.blurple()))
 
 

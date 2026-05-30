@@ -14,9 +14,11 @@ def make_member(id=1, name="usuario", roles=None, display_name=None):
     m.name = name
     m.display_name = display_name or name
     m.roles = roles or []
+    m.mention = f"<@{id}>"
     m.send = AsyncMock()
     m.add_roles = AsyncMock()
     m.ban = AsyncMock()
+    m.timeout = AsyncMock()
     return m
 
 
@@ -107,7 +109,7 @@ async def test_auto_mute_no_terceiro_aviso(cog):
         for i in range(3):
             await Warns.warn.callback(cog, ctx, member, reason=f"warn {i+1}")
 
-    member.add_roles.assert_called_once()
+    member.timeout.assert_called_once()
 
 
 async def test_auto_ban_no_quinto_aviso(cog):

@@ -111,6 +111,23 @@ class MusicControlView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.guild_id = guild_id
+        # Sincroniza estado do botão loop ao criar
+        self._sync_loop_button()
+
+    def _sync_loop_button(self):
+        state = self.cog._state(self.guild_id)
+        btn = discord.utils.get(self.children, callback=self.toggle_loop.callback)
+        if btn is None:
+            return
+        if state.loop:
+            btn.style = discord.ButtonStyle.success
+            btn.label = "Song"
+        elif state.loop_queue:
+            btn.style = discord.ButtonStyle.primary
+            btn.label = "Queue"
+        else:
+            btn.style = discord.ButtonStyle.secondary
+            btn.label = None
 
     @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.secondary)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -146,9 +163,23 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
     async def toggle_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Cicla entre: sem loop → loop da música → loop da fila → sem loop."""
         state = self.cog._state(self.guild_id)
-        state.loop = not state.loop
-        button.style = discord.ButtonStyle.success if state.loop else discord.ButtonStyle.secondary
+        if not state.loop and not state.loop_queue:
+            state.loop = True
+            state.loop_queue = False
+            button.style = discord.ButtonStyle.success
+            button.label = "Song"
+        elif state.loop and not state.loop_queue:
+            state.loop = False
+            state.loop_queue = True
+            button.style = discord.ButtonStyle.primary
+            button.label = "Queue"
+        else:
+            state.loop = False
+            state.loop_queue = False
+            button.style = discord.ButtonStyle.secondary
+            button.label = None
         await interaction.response.edit_message(view=self)
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger)
@@ -197,8 +228,10 @@ class GuildMusicState:
     def __init__(self):
         self.queue: list[dict] = []
         self.current: dict | None = None
-        self.loop: bool = False
+        self.loop: bool = False        # loop da música atual
+        self.loop_queue: bool = False  # loop da fila inteira
         self.volume: float = 0.5
+        self._started_at: float | None = None  # monotonic timestamp do início da faixa
         self._inactivity_task: asyncio.Task | None = None
         self._preload_task: asyncio.Task | None = None
         self._preloaded: dict | None = None
@@ -437,6 +470,15 @@ class Music(commands.Cog, name="Música"):
         h, m = divmod(m, 60)
         return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+    def _progress_bar(self, elapsed: float, total: float, width: int = 16) -> str:
+        """Gera barra de progresso: ▓▓▓▓░░░░ 1:23 / 3:45"""
+        if not total or total <= 0:
+            return "░" * width
+        ratio = min(elapsed / total, 1.0)
+        filled = int(ratio * width)
+        bar = "▓" * filled + "░" * (width - filled)
+        return f"{bar} `{self._duration_fmt(elapsed)} / {self._duration_fmt(total)}`"
+
     def _schedule_preload(self, state: GuildMusicState):
         """Pré-aquece o cache para a próxima música da fila."""
         if state._preload_task and not state._preload_task.done():
@@ -467,6 +509,7 @@ class Music(commands.Cog, name="Música"):
 
     def _start_playing(self, ctx: commands.Context, song: dict):
         state = self._state(ctx.guild.id)
+        state._started_at = time.monotonic()
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(song["source"], **FFMPEG_OPTIONS),
             volume=state.volume,
@@ -499,6 +542,8 @@ class Music(commands.Cog, name="Música"):
         state = self._state(ctx.guild.id)
         if state.loop and state.current:
             state.queue.insert(0, state.current)
+        elif state.loop_queue and state.current:
+            state.queue.append(state.current)  # adiciona ao final para loop da fila
 
         if not state.queue:
             state.current = None
@@ -545,16 +590,22 @@ class Music(commands.Cog, name="Música"):
             description=f"[{song['title']}]({url})" if url else song["title"],
             color=discord.Color.green(),
         )
-        embed.add_field(name="Duração", value=self._duration_fmt(song.get("duration", 0)))
+        # Barra de progresso
+        elapsed = time.monotonic() - state._started_at if state._started_at else 0
+        embed.add_field(
+            name="Progresso",
+            value=self._progress_bar(elapsed, song.get("duration", 0)),
+            inline=False,
+        )
         embed.add_field(name="Canal", value=song.get("uploader", "?"))
-        embed.add_field(name="Loop", value="🔁 On" if state.loop else "Off")
         embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%")
+        loop_status = "🔁 Song" if state.loop else ("🔁 Queue" if state.loop_queue else "Off")
+        embed.add_field(name="Loop", value=loop_status)
         if state.queue:
-            proxima = state.queue[0]
-            embed.add_field(name="A seguir", value=proxima["title"][:50], inline=False)
+            embed.add_field(name="A seguir", value=state.queue[0]["title"][:50], inline=False)
         if song.get("thumbnail"):
             embed.set_thumbnail(url=song["thumbnail"])
-        embed.set_footer(text="⏸ pausar  ⏭ pular  🔀 shuffle  🔁 loop  ⏹ parar")
+        embed.set_footer(text="⏸ pausar  ⏭ pular  🔀 shuffle  🔁 loop (song→queue→off)  ⏹ parar")
 
         view = MusicControlView(self, ctx.guild.id)
 
@@ -697,13 +748,15 @@ class Music(commands.Cog, name="Música"):
 
     # ── Comandos ──────────────────────────────────────────────────────────
 
-    @commands.command(name="join", aliases=["entrar"], help="Entra no seu canal de voz.")
+    @commands.hybrid_command(name="join", aliases=["entrar"], help="Entra no seu canal de voz.")
+    @commands.guild_only()
     async def join(self, ctx: commands.Context):
         if await self._ensure_voice(ctx):
             await ctx.send(embed=music_embed("Conectado", f"Entrei em **{ctx.author.voice.channel.name}**."))
 
-    @commands.command(name="m", aliases=["tocar"], help="Toca música por nome, ou link do YouTube, Spotify ou SoundCloud (faixa/playlist).")
+    @commands.hybrid_command(name="m", aliases=["tocar"], help="Toca música por nome, ou link do YouTube, Spotify ou SoundCloud (faixa/playlist).")
     @commands.cooldown(1, 3, commands.BucketType.user)
+    @commands.guild_only()
     async def play(self, ctx: commands.Context, *, query: str):
         if not await self._ensure_voice(ctx):
             return
@@ -771,7 +824,8 @@ class Music(commands.Cog, name="Música"):
             return await ctx.send(embed=music_embed("Erro", "Não consegui encontrar essa música.", discord.Color.red()))
         await self._enqueue_one(ctx, song)
 
-    @commands.command(name="pause", aliases=["pausar"], help="Pausa a música atual.")
+    @commands.hybrid_command(name="pause", aliases=["pausar"], help="Pausa a música atual.")
+    @commands.guild_only()
     async def pause(self, ctx: commands.Context):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.pause()
@@ -779,7 +833,8 @@ class Music(commands.Cog, name="Música"):
         else:
             await ctx.send(embed=music_embed("Erro", "Nada está tocando.", discord.Color.orange()))
 
-    @commands.command(name="resume", aliases=["continuar"], help="Retoma a música pausada.")
+    @commands.hybrid_command(name="resume", aliases=["continuar"], help="Retoma a música pausada.")
+    @commands.guild_only()
     async def resume(self, ctx: commands.Context):
         if ctx.voice_client and ctx.voice_client.is_paused():
             ctx.voice_client.resume()
@@ -787,8 +842,9 @@ class Music(commands.Cog, name="Música"):
         else:
             await ctx.send(embed=music_embed("Erro", "Nada está pausado.", discord.Color.orange()))
 
-    @commands.command(name="skip", aliases=["s", "pular"], help="Pula para a próxima música.")
+    @commands.hybrid_command(name="skip", aliases=["s", "pular"], help="Pula para a próxima música.")
     @commands.cooldown(1, 2, commands.BucketType.user)
+    @commands.guild_only()
     async def skip(self, ctx: commands.Context):
         if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
             ctx.voice_client.stop()
@@ -796,8 +852,9 @@ class Music(commands.Cog, name="Música"):
         else:
             await ctx.send(embed=music_embed("Erro", "Nada está tocando.", discord.Color.orange()))
 
-    @commands.command(name="stop", aliases=["parar"], help="Para a música e limpa a fila.")
+    @commands.hybrid_command(name="stop", aliases=["parar"], help="Para a música e limpa a fila.")
     @commands.cooldown(1, 5, commands.BucketType.user)
+    @commands.guild_only()
     async def stop(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         state.queue.clear()
@@ -807,7 +864,8 @@ class Music(commands.Cog, name="Música"):
             await ctx.voice_client.disconnect()
         await ctx.send(embed=music_embed("Parado", "Fila limpa e bot desconectado.", discord.Color.red()))
 
-    @commands.command(name="volume", aliases=["vol"], help="Ajusta o volume (0–100).")
+    @commands.hybrid_command(name="volume", aliases=["vol"], help="Ajusta o volume (0–100).")
+    @commands.guild_only()
     async def volume(self, ctx: commands.Context, vol: int):
         if not 0 <= vol <= 100:
             return await ctx.send(embed=music_embed("Erro", "O volume deve ser entre 0 e 100.", discord.Color.orange()))
@@ -817,7 +875,8 @@ class Music(commands.Cog, name="Música"):
             ctx.voice_client.source.volume = state.volume
         await ctx.send(embed=music_embed("Volume", f"Volume ajustado para **{vol}%**."))
 
-    @commands.command(name="nowplaying", aliases=["np", "tocando"], help="Mostra a música atual.")
+    @commands.hybrid_command(name="nowplaying", aliases=["np", "tocando"], help="Mostra a música atual com barra de progresso.")
+    @commands.guild_only()
     async def nowplaying(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         if not state.current:
@@ -829,15 +888,22 @@ class Music(commands.Cog, name="Música"):
             description=f"[{song['title']}]({url})" if url else song["title"],
             color=discord.Color.green(),
         )
-        embed.add_field(name="Duração", value=self._duration_fmt(song.get("duration", 0)))
+        elapsed = time.monotonic() - state._started_at if state._started_at else 0
+        embed.add_field(
+            name="Progresso",
+            value=self._progress_bar(elapsed, song.get("duration", 0)),
+            inline=False,
+        )
         embed.add_field(name="Canal", value=song.get("uploader", "?"))
-        embed.add_field(name="Loop", value="Ativado" if state.loop else "Desativado")
+        loop_status = "🔁 Song" if state.loop else ("🔁 Queue" if state.loop_queue else "Off")
+        embed.add_field(name="Loop", value=loop_status)
         embed.add_field(name="Volume", value=f"{int(state.volume * 100)}%")
         if song.get("thumbnail"):
             embed.set_thumbnail(url=song["thumbnail"])
         await ctx.send(embed=embed)
 
-    @commands.command(name="queue", aliases=["fila", "q"], help="Exibe a fila de músicas.")
+    @commands.hybrid_command(name="queue", aliases=["fila", "q"], help="Exibe a fila de músicas.")
+    @commands.guild_only()
     async def queue_cmd(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         if not state.queue and not state.current:
@@ -856,23 +922,37 @@ class Music(commands.Cog, name="Música"):
             if len(state.queue) > 10:
                 lines.append(f"*...e mais {len(state.queue) - 10} músicas*")
             embed.add_field(name="Próximas", value="\n".join(lines), inline=False)
-        embed.set_footer(text=f"Total na fila: {len(state.queue)} | Loop: {'On' if state.loop else 'Off'}")
+        loop_label = "Song" if state.loop else ("Queue" if state.loop_queue else "Off")
+        embed.set_footer(text=f"Total na fila: {len(state.queue)} | Loop: {loop_label}")
         await ctx.send(embed=embed)
 
-    @commands.command(name="loop", help="Ativa/desativa o loop da música atual.")
+    @commands.hybrid_command(name="loop", help="Cicla o loop: sem loop → loop da música → loop da fila.")
+    @commands.guild_only()
     async def loop_cmd(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
-        state.loop = not state.loop
-        await ctx.send(embed=music_embed("Loop", f"Loop {'ativado' if state.loop else 'desativado'}."))
+        if not state.loop and not state.loop_queue:
+            state.loop = True
+            msg = "🔁 Loop da **música atual** ativado."
+        elif state.loop:
+            state.loop = False
+            state.loop_queue = True
+            msg = "🔁 Loop da **fila inteira** ativado."
+        else:
+            state.loop = False
+            state.loop_queue = False
+            msg = "Loop **desativado**."
+        await ctx.send(embed=music_embed("Loop", msg))
 
-    @commands.command(name="clear", aliases=["limpar"], help="Limpa a fila sem parar a música.")
+    @commands.hybrid_command(name="clear", aliases=["limpar"], help="Limpa a fila sem parar a música.")
+    @commands.guild_only()
     async def clear_queue(self, ctx: commands.Context):
         state = self._state(ctx.guild.id)
         state.queue.clear()
         state._preloaded = None
         await ctx.send(embed=music_embed("Fila limpa", "Todas as músicas da fila foram removidas."))
 
-    @commands.command(name="remove", aliases=["remover"], help="Remove uma música da fila pelo número.")
+    @commands.hybrid_command(name="remove", aliases=["remover"], help="Remove uma música da fila pelo número.")
+    @commands.guild_only()
     async def remove(self, ctx: commands.Context, index: int):
         state = self._state(ctx.guild.id)
         if not 1 <= index <= len(state.queue):

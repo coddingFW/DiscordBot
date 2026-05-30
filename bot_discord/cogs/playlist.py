@@ -49,7 +49,7 @@ class Playlist(commands.Cog, name="Playlists"):
             await self._db.close()
             self._db = None
 
-    @commands.group(name="playlist", aliases=["pl"], invoke_without_command=True)
+    @commands.hybrid_group(name="playlist", aliases=["pl"], invoke_without_command=True)
     async def playlist(self, ctx: commands.Context):
         await ctx.send(
             embed=pl_embed(
