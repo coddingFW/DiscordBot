@@ -213,6 +213,120 @@ SPOTIPY_CLIENT_SECRET=seu_client_secret_aqui
 
 ---
 
+## Testes
+
+### Testes automatizados
+
+O projeto usa **pytest** com cobertura de código via **Codecov**. Os testes rodam automaticamente a cada push via GitHub Actions.
+
+```bash
+# Instalar dependências de dev
+pip install -r requirements-dev.txt
+
+# Rodar todos os testes
+pytest
+
+# Rodar com relatório de cobertura
+pytest --cov=cogs --cov=bot --cov-report=term-missing
+```
+
+| Módulo | Cobertura | O que é testado |
+|---|---|---|
+| `warns.py` | 96% | Registro, contador, auto-mute, auto-ban, delwarn, clearwarns |
+| `utility.py` | 96% | ping, uptime, serverinfo, userinfo, avatar, botinfo, say, embed |
+| `moderation.py` | 91% | kick, ban, unban, purge, mute, unmute |
+| `playlist.py` | 79% | CRUD completo de playlists no SQLite |
+| `logs.py` | 66% | log_embed, send_log, listeners de join/delete |
+| `ai.py` | 25% | Limpeza TTS, anti-injection, erros amigáveis, rate limit, presets |
+| `music.py` | 26% | Cache de busca, detecção de URLs, formatação de duração |
+
+> Partes que dependem de conexão real com Discord (voz, playback) ou APIs externas (Gemini, edge-tts) são cobertas pelos testes manuais abaixo.
+
+---
+
+### Checklist de testes manuais
+
+Execute este checklist antes de cada deploy em produção.
+
+#### Música
+
+- [ ] `!m <nome da música>` — bot entra no canal de voz e começa a tocar
+- [ ] Painel de controle aparece com os botões ⏸ ⏭ 🔀 🔁 ⏹
+- [ ] Botão ⏸ pausa a música (ícone muda para ▶️)
+- [ ] Botão ▶️ retoma a música (ícone volta para ⏸)
+- [ ] Botão ⏭ pula para a próxima música
+- [ ] Botão 🔁 ativa o loop (botão fica verde), `!m` de nova música adiciona à fila
+- [ ] Botão 🔀 embaralha a fila
+- [ ] Botão ⏹ para a música e desconecta o bot
+- [ ] `!m <URL do YouTube>` toca por link direto
+- [ ] `!m <URL de playlist do YouTube>` carrega todas as faixas na fila
+- [ ] `!m <URL do Spotify — faixa>` converte e toca no YouTube
+- [ ] `!m <URL de playlist do Spotify>` carrega todas as faixas
+- [ ] `!m <URL do SoundCloud>` toca faixa do SoundCloud
+- [ ] Bot desconecta automaticamente após 2 minutos sem tocar
+- [ ] Bot reconecta automaticamente após queda de conexão de voz
+
+#### Moderação e Avisos
+
+- [ ] `!warn @membro motivo` — registra aviso, envia DM ao membro, mostra `Aviso #1`
+- [ ] `!warn` no mesmo membro 2x — mostra `Aviso #2` e avisa que próximo aplicará mute
+- [ ] `!warn` no mesmo membro 3x — aplica **mute automático**, cargo "Muted" é criado/atribuído
+- [ ] `!warn` no mesmo membro 4x e 5x — no 5º aplica **ban automático**
+- [ ] `!warns @membro` — exibe histórico com ID, data, motivo e moderador
+- [ ] `!delwarn <id>` — remove aviso específico do histórico
+- [ ] `!clearwarns @membro` — limpa todos os avisos, requer permissão de admin
+- [ ] `!kick @membro motivo` — expulsa e registra no canal de logs
+- [ ] `!ban @membro motivo` — bane e registra no canal de logs
+- [ ] `!unban <ID>` — remove o ban
+- [ ] `!purge 10` — apaga 10 mensagens do canal
+- [ ] `!mute @membro` — silencia o membro em todos os canais
+- [ ] `!unmute @membro` — remove o silêncio
+
+#### Logs de auditoria
+
+- [ ] Canal `#logs` recebe log ao usar `!kick`, `!ban`, `!warn`, `!mute`
+- [ ] Canal `#logs` registra quando um membro entra no servidor
+- [ ] Canal `#logs` registra quando uma mensagem é deletada
+- [ ] Canal `#logs` registra ban/unban feito pelo painel do Discord (não só por comando)
+
+#### Playlists
+
+- [ ] `!playlist criar <nome>` — cria playlist
+- [ ] `!playlist add <nome> <música>` — adiciona música à playlist
+- [ ] `!playlist ver <nome>` — lista as músicas com numeração
+- [ ] `!playlist tocar <nome>` — coloca todas na fila e começa a tocar
+- [ ] `!playlist remove <nome> <nº>` — remove música e renumera corretamente
+- [ ] `!playlist deletar <nome>` — remove playlist e todas as músicas
+- [ ] `!playlist lista` — exibe todas as playlists do servidor
+
+#### Assistente IA
+
+- [ ] Mensagem no canal `#ia` recebe resposta do Gemini
+- [ ] Botão 🔊 **Ouvir** gera arquivo de áudio e envia em DM privada
+- [ ] "toca <música>" no canal IA — bot entra na voz e toca
+- [ ] "pula a música" no canal IA — pula a faixa atual
+- [ ] "para a música" no canal IA — para e desconecta
+- [ ] "cria um canal chamado X" — cria o canal (pede permissão de gerenciar canais)
+- [ ] "publica X no canal #geral" — envia mensagem no canal correto
+- [ ] "quem tá online?" — lista membros online
+- [ ] Ação destrutiva (kick/ban/deletar canal) exibe botão de **Confirmação** antes de executar
+- [ ] Mensagem com "ignore previous instructions" é bloqueada (anti-injection)
+- [ ] `!ia-canal #canal` — muda o canal onde a IA responde
+- [ ] `!ia-tom formal` — IA passa a responder em tom formal
+- [ ] `!ia-voz antonio` — botão 🔊 Ouvir usa a voz masculina
+- [ ] `!ia-limpar` — IA "esquece" o histórico de conversa do canal
+- [ ] Rate limit: mais de 5 mensagens por minuto exibe aviso e ignora o excesso
+
+#### Utilitários
+
+- [ ] `!ping` — exibe latência em ms com cor (verde/laranja/vermelho)
+- [ ] `!uptime` — exibe tempo online corretamente
+- [ ] `!serverinfo` — exibe informações do servidor com ícone
+- [ ] `!userinfo @membro` — exibe cargos, datas e avatar
+- [ ] `!botinfo` — exibe número de servidores e latência atual
+
+---
+
 ## Dependências
 
 | Pacote | Uso |
